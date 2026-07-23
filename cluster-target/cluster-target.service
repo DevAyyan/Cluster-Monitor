@@ -1,0 +1,18 @@
+[Unit]
+Description=Cluster Target Monitoring Agent (Fleet Monitor)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/cluster-target/environment
+ExecStart=/usr/local/bin/cluster-target
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/cluster-target
+AmbientCapabilities=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

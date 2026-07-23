@@ -1,0 +1,8 @@
+FROM postgres:15-alpine
+WORKDIR /app
+COPY backend-new /app/backend
+COPY static /app/static
+COPY agent_assets /app/agent_assets
+COPY go.mod go.sum /app/
+EXPOSE 8081
+CMD ["/app/backend"]

@@ -1,0 +1,12 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+cluster-target/cluster-target
+cluster-host/backend/backend_new
+
+# Logs
+*.log
+target.log

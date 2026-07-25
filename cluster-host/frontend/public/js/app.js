@@ -48,12 +48,20 @@ function initApp() {
             e.preventDefault();
             if (!currentActiveServer) return;
 
-            const metric = document.getElementById('alert-metric').value;
+            let metric = document.getElementById('alert-metric').value;
+            if (metric === 'custom') {
+                metric = document.getElementById('alert-metric-custom').value.trim();
+                if (!metric) {
+                    showToast('Validation Error', 'Custom metric key is required.', 'warning', 4000);
+                    return;
+                }
+            }
+            const operator = document.getElementById('alert-operator').value;
             const threshold = parseFloat(document.getElementById('alert-threshold').value);
             const duration = parseInt(document.getElementById('alert-duration').value);
             const email = document.getElementById('alert-email').value;
 
-            registerAlertRule(currentActiveServer, metric, threshold, duration, email);
+            registerAlertRule(currentActiveServer, metric, operator, threshold, duration, email);
         });
     }
 
@@ -67,9 +75,54 @@ function initApp() {
         });
     }
 
-    // Initial Dashboard Load
+    // Initial Dashboard Load & Sub-Second SSE Stream
+    fetchUserProfile();
     fetchDashboardData();
-    setInterval(fetchDashboardData, 3000);
+    initLiveStream();
+    setInterval(fetchDashboardData, 5000);
+}
+
+function initLiveStream() {
+    if (typeof EventSource !== 'undefined') {
+        const sse = new EventSource('/api/stream/metrics');
+        sse.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                if (typeof fetchDashboardData === 'function') {
+                    fetchDashboardData();
+                }
+            } catch (e) {
+                console.error("Stream error:", e);
+            }
+        };
+    }
+}
+
+async function fetchUserProfile() {
+    try {
+        const resp = await fetch('/api/auth/user');
+        if (!resp.ok) {
+            if (resp.status === 401) {
+                window.location.href = '/static/login.html';
+            }
+            return;
+        }
+        const user = await resp.json();
+        
+        // Populate sidebar footer
+        const profileName = document.getElementById('user-profile-name');
+        const profileEmail = document.getElementById('user-profile-email');
+        if (profileName) profileName.textContent = user.username;
+        if (profileEmail) profileEmail.textContent = user.email;
+
+        // Populate forms
+        const alertEmail = document.getElementById('alert-email');
+        const editAlertEmail = document.getElementById('edit-alert-email');
+        if (alertEmail) alertEmail.value = user.email;
+        if (editAlertEmail) editAlertEmail.value = user.email;
+    } catch (err) {
+        console.error("Failed to fetch user profile:", err);
+    }
 }
 
 // Fetch and render servers dashboard cards in parallel
@@ -104,6 +157,7 @@ async function fetchDashboardData() {
                 const el = document.createElement('a');
                 el.className = 'server-list-item';
                 el.href = '#';
+                el.title = server.hostname;
                 el.onclick = (e) => { e.preventDefault(); openServerDetails(server.id); };
                 
                 const dotClass = server.status === 'online' ? 'online' : 'offline';

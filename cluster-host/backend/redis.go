@@ -68,6 +68,16 @@ func (r *RedisClient) Get(key string) (string, error) {
 	return val, err
 }
 
+func (r *RedisClient) Del(key string) error {
+	if r == nil || r.client == nil {
+		return fmt.Errorf("redis client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	return r.client.Del(ctx, key).Err()
+}
+
 func (r *RedisClient) SetEX(key string, value string, seconds int) error {
 	if r == nil || r.client == nil {
 		return fmt.Errorf("redis client not initialized")
@@ -76,6 +86,16 @@ func (r *RedisClient) SetEX(key string, value string, seconds int) error {
 	defer cancel()
 
 	return r.client.Set(ctx, key, value, time.Duration(seconds)*time.Second).Err()
+}
+
+func (r *RedisClient) Publish(channel string, message string) error {
+	if r == nil || r.client == nil {
+		return fmt.Errorf("redis client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	return r.client.Publish(ctx, channel, message).Err()
 }
 
 // Generic JSON cache helpers

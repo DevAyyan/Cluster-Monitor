@@ -23,8 +23,8 @@ import (
 
 const (
 	apiVersion   = "/api/v1"
-	listenAddr   = "0.0.0.0:9192"
-	pushInterval = 10 * time.Second
+	listenAddr   = "0.0.0.0:59191"
+	pushInterval = 1 * time.Second
 )
 
 var (
@@ -76,11 +76,31 @@ func main() {
 	http.HandleFunc(apiVersion+"/storage", authOptional(handleStorage))
 	http.HandleFunc(apiVersion+"/containers", authOptional(handleContainers))
 	http.HandleFunc(apiVersion+"/container-action", authOptional(handleContainerAction))
+	http.HandleFunc(apiVersion+"/logs", authOptional(handleLogs)) // GET / POST API failure logs
 	http.HandleFunc(apiVersion+"/endpoint", handleEndpoint) // add/remove Host endpoints
+	http.HandleFunc(apiVersion+"/uninstall", handleUninstall) // self-destruction teardown
 
 	log.Printf("[cluster-target] listening on %s (serverID=%s, endpoints=%d)", listenAddr, serverID, len(endpoints))
 	go pushLoop()
+	go logMonitorLoop()
 	log.Fatal(http.ListenAndServe(listenAddr, nil))
+}
+
+func handleUninstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"uninstalling"}`))
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Println("[uninstall] Self-destruct teardown payload received. Cleaning up daemon...")
+		cmd := exec.Command("sh", "-c", "sudo systemctl stop cluster-target.service 2>/dev/null; sudo systemctl disable cluster-target.service 2>/dev/null; sudo rm -f /etc/systemd/system/cluster-target.service; sudo systemctl daemon-reload 2>/dev/null; sudo rm -rf /etc/cluster-target; sudo pkill -9 -f cluster-target; sudo rm -f /usr/local/bin/cluster-target")
+		_ = cmd.Run()
+		os.Exit(0)
+	}()
 }
 
 // ---- Stable Server ID ----
@@ -199,11 +219,28 @@ func loadEndpoints() {
 func saveEndpoints() error {
 	endpointMu.Lock()
 	defer endpointMu.Unlock()
+	if len(endpoints) == 0 {
+		_ = os.Remove(endpointsFile)
+		return nil
+	}
 	dir := filepath.Dir(endpointsFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	return os.WriteFile(endpointsFile, []byte(strings.Join(endpoints, "\n")+"\n"), 0644)
+}
+
+func selfDestruct() {
+	log.Println("[cluster-target] No host endpoints remaining. Self-destructing target agent...")
+	_ = os.Remove(endpointsFile)
+	if exe, err := os.Executable(); err == nil {
+		_ = os.Remove(exe)
+	}
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Println("[cluster-target] Self-destruction complete. Process terminating.")
+		os.Exit(0)
+	}()
 }
 
 func handleEndpoint(w http.ResponseWriter, r *http.Request) {
@@ -212,8 +249,9 @@ func handleEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p struct {
-		Action string `json:"action"` // "add" or "remove"
+		Action string `json:"action"` // "add", "remove", "replace", "set"
 		URL    string `json:"url"`
+		OldURL string `json:"old_url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.URL == "" {
 		http.Error(w, "Invalid body (need action + url)", http.StatusBadRequest)
@@ -225,25 +263,46 @@ func handleEndpoint(w http.ResponseWriter, r *http.Request) {
 		if !contains(endpoints, p.URL) {
 			endpoints = append(endpoints, p.URL)
 		}
-	case "remove":
-		out := endpoints[:0]
+	case "set":
+		endpoints = []string{p.URL}
+	case "replace":
+		out := make([]string, 0, len(endpoints))
 		for _, e := range endpoints {
-			if e != p.URL {
+			if e != p.OldURL && e != p.URL {
+				out = append(out, e)
+			}
+		}
+		out = append(out, p.URL)
+		endpoints = out
+	case "remove":
+		out := make([]string, 0, len(endpoints))
+		for _, e := range endpoints {
+			if e != p.URL && !strings.Contains(e, p.URL) {
 				out = append(out, e)
 			}
 		}
 		endpoints = out
 	default:
 		endpointMu.Unlock()
-		http.Error(w, "action must be add|remove", http.StatusBadRequest)
+		http.Error(w, "action must be add|remove|replace|set", http.StatusBadRequest)
 		return
 	}
+	emptyEndpoints := len(endpoints) == 0
 	endpointMu.Unlock()
+
 	if err := saveEndpoints(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "endpoints": endpoints})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "ok",
+		"endpoints":     endpoints,
+		"self_destruct": emptyEndpoints,
+	})
+
+	if emptyEndpoints {
+		selfDestruct()
+	}
 }
 
 func contains(s []string, v string) bool {
@@ -284,6 +343,89 @@ func pushLoop() {
 	}
 }
 
+// logMonitorLoop periodically scans system logs (journalctl) and Docker container logs for API failures & 5xx errors.
+func logMonitorLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	var seenLogsMu sync.Mutex
+	seenLogs := make(map[string]bool)
+
+	isAPIFailureLine := func(line string) bool {
+		l := strings.ToLower(line)
+		return strings.Contains(l, " 500 ") || strings.Contains(l, " 502 ") || strings.Contains(l, " 503 ") || strings.Contains(l, " 504 ") ||
+			strings.Contains(l, "http/1.1 5") || strings.Contains(l, "http/2 5") || strings.Contains(l, "\"status\":5") ||
+			strings.Contains(l, "api error") || strings.Contains(l, "connection refused") || strings.Contains(l, "internal server error") ||
+			strings.Contains(l, "bad gateway") || strings.Contains(l, "gateway timeout")
+	}
+
+	for range ticker.C {
+		// 1. Scan System Logs (journalctl)
+		out, err := exec.Command("bash", "-c", "journalctl -n 30 --since '12 seconds ago' --no-pager 2>/dev/null").CombinedOutput()
+		if err == nil && len(out) > 0 {
+			lines := strings.Split(string(out), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				if isAPIFailureLine(line) {
+					seenLogsMu.Lock()
+					alreadySeen := seenLogs[line]
+					if !alreadySeen {
+						seenLogs[line] = true
+						if len(seenLogs) > 1000 {
+							seenLogs = make(map[string]bool)
+						}
+					}
+					seenLogsMu.Unlock()
+
+					if !alreadySeen {
+						logAPIFailure("systemlogs/journalctl", "systemd", 500, line)
+					}
+				}
+			}
+		}
+
+		// 2. Scan Running Docker Containers Logs
+		cOut, err := exec.Command("docker", "ps", "--format", "{{.ID}} {{.Names}}").CombinedOutput()
+		if err == nil && len(cOut) > 0 {
+			cLines := strings.Split(strings.TrimSpace(string(cOut)), "\n")
+			for _, cLine := range cLines {
+				parts := strings.Fields(cLine)
+				if len(parts) < 2 {
+					continue
+				}
+				cID, cName := parts[0], parts[1]
+
+				lOut, lErr := exec.Command("docker", "logs", "--since", "12s", cID).CombinedOutput()
+				if lErr == nil && len(lOut) > 0 {
+					logLines := strings.Split(string(lOut), "\n")
+					for _, lLine := range logLines {
+						lLine = strings.TrimSpace(lLine)
+						if lLine == "" {
+							continue
+						}
+						if isAPIFailureLine(lLine) {
+							seenLogsMu.Lock()
+							alreadySeen := seenLogs[lLine]
+							if !alreadySeen {
+								seenLogs[lLine] = true
+								if len(seenLogs) > 1000 {
+									seenLogs = make(map[string]bool)
+								}
+							}
+							seenLogsMu.Unlock()
+
+							if !alreadySeen {
+								logAPIFailure("container/"+cName, "docker_logs", 500, lLine)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 // ---- Local API handlers ----
 
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -303,9 +445,98 @@ func handleProcesses(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(parsePS(string(out)))
 }
 
+type FailureLog struct {
+	Timestamp  string `json:"timestamp"`
+	Endpoint   string `json:"endpoint"`
+	Action     string `json:"action,omitempty"`
+	StatusCode int    `json:"status_code"`
+	Error      string `json:"error"`
+	ServerID   string `json:"server_id,omitempty"`
+}
+
+var (
+	failureLogsMu sync.RWMutex
+	failureLogs   []FailureLog
+)
+
+func logAPIFailure(endpoint, action string, statusCode int, errStr string) {
+	entry := FailureLog{
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		Endpoint:   endpoint,
+		Action:     action,
+		StatusCode: statusCode,
+		Error:      errStr,
+		ServerID:   serverID,
+	}
+	failureLogsMu.Lock()
+	failureLogs = append(failureLogs, entry)
+	if len(failureLogs) > 200 {
+		failureLogs = failureLogs[1:]
+	}
+	failureLogsMu.Unlock()
+
+	log.Printf("[API-FAILURE] %s %s (status %d): %s", endpoint, action, statusCode, errStr)
+
+	file := filepath.Join(configDir(), "api_failures.log")
+	line := fmt.Sprintf("[%s] %s %s (status %d): %s\n", entry.Timestamp, endpoint, action, statusCode, errStr)
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err == nil {
+		f.WriteString(line)
+		f.Close()
+	}
+
+	go pushFailureLogToHost(entry)
+}
+
+func pushFailureLogToHost(entry FailureLog) {
+	endpointMu.Lock()
+	eps := append([]string{}, endpoints...)
+	endpointMu.Unlock()
+
+	payload, _ := json.Marshal(entry)
+	for _, base := range eps {
+		u := strings.TrimRight(base, "/") + "/api/ingest/" + serverID + "/logs"
+		req, err := http.NewRequest(http.MethodPost, u, strings.NewReader(string(payload)))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+}
+
+func handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var entry FailureLog
+		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		logAPIFailure(entry.Endpoint, entry.Action, entry.StatusCode, entry.Error)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+
+	failureLogsMu.RLock()
+	logsCopy := append([]FailureLog{}, failureLogs...)
+	failureLogsMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "ok",
+		"count":    len(logsCopy),
+		"failures": logsCopy,
+	})
+}
+
 func handleSystemLogs(w http.ResponseWriter, r *http.Request) {
 	out, err := exec.Command("bash", "-c", "journalctl -n 100 --no-pager 2>/dev/null").CombinedOutput()
 	if err != nil && len(out) == 0 {
+		logAPIFailure("/systemlogs", "journalctl", http.StatusInternalServerError, err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -315,7 +546,7 @@ func handleSystemLogs(w http.ResponseWriter, r *http.Request) {
 
 func handleNetworks(w http.ResponseWriter, r *http.Request) {
 	out, err := exec.Command("bash", "-c",
-		"ip -br addr 2>/dev/null; echo '---PROC---'; cat /proc/net/dev 2>/dev/null").CombinedOutput()
+		"ip -br link 2>/dev/null; echo '---ADDR---'; ip -br addr 2>/dev/null; echo '---PROC---'; cat /proc/net/dev 2>/dev/null").CombinedOutput()
 	if err != nil && len(out) == 0 {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -821,17 +1052,58 @@ func parsePS(out string) []map[string]interface{} {
 	return procs
 }
 
+func formatBytes(bytesStr string) string {
+	var b float64
+	_, err := fmt.Sscanf(bytesStr, "%f", &b)
+	if err != nil || b == 0 {
+		return "0 B"
+	}
+	if b >= 1024*1024*1024 {
+		return fmt.Sprintf("%.2f GB", b/(1024*1024*1024))
+	}
+	if b >= 1024*1024 {
+		return fmt.Sprintf("%.1f MB", b/(1024*1024))
+	}
+	if b >= 1024 {
+		return fmt.Sprintf("%.1f KB", b/1024)
+	}
+	return fmt.Sprintf("%.0f B", b)
+}
+
 func parseNetworks(out string) []map[string]interface{} {
 	parts := strings.Split(out, "---PROC---")
-	ipLines, procLines := []string{}, []string{}
-	if len(parts) > 0 {
-		ipLines = strings.Split(parts[0], "\n")
+	linkAddrParts := strings.Split(parts[0], "---ADDR---")
+
+	linkLines := []string{}
+	addrLines := []string{}
+	procLines := []string{}
+
+	if len(linkAddrParts) > 0 {
+		linkLines = strings.Split(linkAddrParts[0], "\n")
+	}
+	if len(linkAddrParts) > 1 {
+		addrLines = strings.Split(linkAddrParts[1], "\n")
+	} else {
+		addrLines = linkLines
 	}
 	if len(parts) > 1 {
 		procLines = strings.Split(parts[1], "\n")
 	}
+
+	macMap := map[string]string{}
+	for _, line := range linkLines {
+		f := strings.Fields(line)
+		if len(f) >= 3 {
+			name := strings.TrimSuffix(f[0], ":")
+			mac := f[2]
+			if strings.Contains(mac, ":") {
+				macMap[name] = mac
+			}
+		}
+	}
+
 	ipMap := map[string]string{}
-	for _, line := range ipLines {
+	for _, line := range addrLines {
 		f := strings.Fields(line)
 		if len(f) < 3 {
 			continue
@@ -840,12 +1112,17 @@ func parseNetworks(out string) []map[string]interface{} {
 		ip := "N/A"
 		for _, x := range f[2:] {
 			if strings.Contains(x, ".") && !strings.HasPrefix(x, "127.") {
-				ip = x
+				ip = strings.Split(x, "/")[0]
+				break
+			}
+			if strings.Contains(x, ":") && x != "::1" && !strings.HasPrefix(x, "fe80") {
+				ip = strings.Split(x, "/")[0]
 				break
 			}
 		}
 		ipMap[name] = ip
 	}
+
 	var result []map[string]interface{}
 	for i, line := range procLines {
 		if i < 2 {
@@ -856,13 +1133,26 @@ func parseNetworks(out string) []map[string]interface{} {
 			continue
 		}
 		name := strings.TrimSuffix(f[0], ":")
+		if name == "lo" || strings.HasPrefix(name, "lo") {
+			continue
+		}
 		ip := "N/A"
 		if v, ok := ipMap[name]; ok {
 			ip = v
 		}
+		mac := "N/A"
+		if v, ok := macMap[name]; ok {
+			mac = v
+		}
+
 		result = append(result, map[string]interface{}{
-			"name": name, "ip": ip, "rxSpeed": "Active", "txSpeed": "Active",
-			"rxTotal": f[1], "txTotal": f[9],
+			"name":    name,
+			"ip":      ip,
+			"mac":     mac,
+			"rxSpeed": "Active",
+			"txSpeed": "Active",
+			"rxTotal": formatBytes(f[1]),
+			"txTotal": formatBytes(f[9]),
 		})
 	}
 	return result

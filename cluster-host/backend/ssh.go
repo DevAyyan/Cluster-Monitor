@@ -23,6 +23,9 @@ import (
 // Set via HOST_ENDPOINT env (e.g. http://10.0.0.5:8080). Empty = push disabled.
 var hostEndpoint string
 
+// previousHostEndpoint stores the host's most recent IP/endpoint before an IP change.
+var previousHostEndpoint string
+
 // sshError writes a JSON {error: msg} so the dashboard can surface the real
 // SSH failure reason instead of a generic "agent offline" message.
 func sshError(w http.ResponseWriter, msg string) {
@@ -121,7 +124,7 @@ func doAgentRequest(info serverSSHInfo, path string) ([]byte, error) {
 			if h == "" {
 				continue
 			}
-			url := fmt.Sprintf("http://%s:9192/api/v1/%s", h, path)
+			url := fmt.Sprintf("http://%s:59191/api/v1/%s", h, path)
 			resp, err := client.Get(url)
 			if err == nil {
 				defer resp.Body.Close()
@@ -133,11 +136,11 @@ func doAgentRequest(info serverSSHInfo, path string) ([]byte, error) {
 		}
 		// Direct HTTP failed — cache unreachable for 30s to prevent log spam and 1s latency per request
 		setDirectReachable(info.Host, false)
-		log.Printf("[agent-request] Direct HTTP port 9192 unavailable for %s/%s, using SSH fallback (cached 30s)", info.Host, path)
+		log.Printf("[agent-request] Direct HTTP port 59191 unavailable for %s/%s, using SSH fallback (cached 30s)", info.Host, path)
 	}
 
 	// Fallback to SSH execution on the remote host
-	sshCmd := fmt.Sprintf("curl -s http://localhost:9192/api/v1/%s", path)
+	sshCmd := fmt.Sprintf("curl -s http://localhost:59191/api/v1/%s", path)
 	out, errSSH := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, sshCmd)
 	if errSSH == nil && len(out) > 0 {
 		return []byte(out), nil
@@ -165,7 +168,7 @@ func doAgentPostRequest(info serverSSHInfo, path string, body []byte) ([]byte, e
 		if h == "" {
 			continue
 		}
-		url := fmt.Sprintf("http://%s:9192/api/v1/%s", h, path)
+		url := fmt.Sprintf("http://%s:59191/api/v1/%s", h, path)
 		resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 		if err == nil {
 			defer resp.Body.Close()
@@ -181,7 +184,7 @@ func doAgentPostRequest(info serverSSHInfo, path string, body []byte) ([]byte, e
 
 	// SSH fallback — use curl with the JSON body if direct agent port is blocked
 	sshCmd := fmt.Sprintf(
-		`curl -s -X POST -H 'Content-Type: application/json' -d '%s' http://localhost:9192/api/v1/%s`,
+		`curl -s -X POST -H 'Content-Type: application/json' -d '%s' http://localhost:59191/api/v1/%s`,
 		strings.ReplaceAll(string(body), "'", `'\''`), path,
 	)
 	out, errSSH := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, sshCmd)
@@ -782,7 +785,7 @@ func sshGetNetworks(info serverSSHInfo) ([]map[string]interface{}, error) {
 	}
 
 	// Fallback to raw SSH execution if agent fails
-	cmd := "ip -br addr 2>/dev/null; echo '---PROC---'; cat /proc/net/dev 2>/dev/null"
+	cmd := "ip -br link 2>/dev/null; echo '---ADDR---'; ip -br addr 2>/dev/null; echo '---PROC---'; cat /proc/net/dev 2>/dev/null"
 	out, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd)
 	if err != nil {
 		return nil, err
@@ -790,34 +793,71 @@ func sshGetNetworks(info serverSSHInfo) ([]map[string]interface{}, error) {
 	return parseNetworks(out), nil
 }
 
+func formatBytes(bytesStr string) string {
+	var b float64
+	_, err := fmt.Sscanf(bytesStr, "%f", &b)
+	if err != nil || b == 0 {
+		return "0 B"
+	}
+	if b >= 1024*1024*1024 {
+		return fmt.Sprintf("%.2f GB", b/(1024*1024*1024))
+	}
+	if b >= 1024*1024 {
+		return fmt.Sprintf("%.1f MB", b/(1024*1024))
+	}
+	if b >= 1024 {
+		return fmt.Sprintf("%.1f KB", b/1024)
+	}
+	return fmt.Sprintf("%.0f B", b)
+}
+
 func parseNetworks(out string) []map[string]interface{} {
 	parts := strings.Split(out, "---PROC---")
-	ipLines := []string{}
+	linkAddrParts := strings.Split(parts[0], "---ADDR---")
+
+	linkLines := []string{}
+	addrLines := []string{}
 	procLines := []string{}
-	if len(parts) > 0 {
-		ipLines = strings.Split(parts[0], "\n")
+
+	if len(linkAddrParts) > 0 {
+		linkLines = strings.Split(linkAddrParts[0], "\n")
+	}
+	if len(linkAddrParts) > 1 {
+		addrLines = strings.Split(linkAddrParts[1], "\n")
+	} else {
+		addrLines = linkLines
 	}
 	if len(parts) > 1 {
 		procLines = strings.Split(parts[1], "\n")
 	}
 
-	// map iface -> ip
+	macMap := map[string]string{}
+	for _, line := range linkLines {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			name := strings.TrimSuffix(fields[0], ":")
+			mac := fields[2]
+			if strings.Contains(mac, ":") {
+				macMap[name] = mac
+			}
+		}
+	}
+
 	ipMap := map[string]string{}
-	for _, line := range ipLines {
+	for _, line := range addrLines {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
 			continue
 		}
 		name := strings.TrimSuffix(fields[0], ":")
-		// find an IPv4-looking address token
 		ip := "N/A"
 		for _, f := range fields[2:] {
 			if strings.Contains(f, ".") && !strings.HasPrefix(f, "127.") {
-				ip = f
+				ip = strings.Split(f, "/")[0]
 				break
 			}
 			if strings.Contains(f, ":") && f != "::1" && !strings.HasPrefix(f, "fe80") {
-				ip = f
+				ip = strings.Split(f, "/")[0]
 				break
 			}
 		}
@@ -825,9 +865,8 @@ func parseNetworks(out string) []map[string]interface{} {
 	}
 
 	var result []map[string]interface{}
-	// skip header line in /proc/net/dev
 	for i, line := range procLines {
-		if i == 0 {
+		if i < 2 {
 			continue
 		}
 		fields := strings.Fields(line)
@@ -835,19 +874,26 @@ func parseNetworks(out string) []map[string]interface{} {
 			continue
 		}
 		name := strings.TrimSuffix(fields[0], ":")
-		rxTotal := fields[1]
-		txTotal := fields[9]
+		if name == "lo" || strings.HasPrefix(name, "lo") {
+			continue
+		}
 		ip := "N/A"
 		if v, ok := ipMap[name]; ok {
 			ip = v
 		}
+		mac := "N/A"
+		if v, ok := macMap[name]; ok {
+			mac = v
+		}
+
 		result = append(result, map[string]interface{}{
 			"name":    name,
 			"ip":      ip,
+			"mac":     mac,
 			"rxSpeed": "Active",
 			"txSpeed": "Active",
-			"rxTotal": rxTotal,
-			"txTotal": txTotal,
+			"rxTotal": formatBytes(fields[1]),
+			"txTotal": formatBytes(fields[9]),
 		})
 	}
 	return result
@@ -1287,7 +1333,13 @@ func sshAgentAddEndpoint(info serverSSHInfo, endpoint string) error {
 	if endpoint == "" {
 		return nil
 	}
-	cmd := fmt.Sprintf(`curl -s -X POST http://localhost:9192/api/v1/endpoint -H 'Content-Type: application/json' -d '{"action":"add","url":%q}' 2>/dev/null || true`, endpoint)
+	var payload string
+	if previousHostEndpoint != "" && previousHostEndpoint != endpoint {
+		payload = fmt.Sprintf(`{"action":"replace","old_url":%q,"url":%q}`, previousHostEndpoint, endpoint)
+	} else {
+		payload = fmt.Sprintf(`{"action":"add","url":%q}`, endpoint)
+	}
+	cmd := fmt.Sprintf(`curl -s -X POST http://localhost:59191/api/v1/endpoint -H 'Content-Type: application/json' -d '%s' 2>/dev/null || true`, strings.ReplaceAll(payload, "'", `'\''`))
 	if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd); err != nil {
 		return fmt.Errorf("add endpoint: %w", err)
 	}
@@ -1300,7 +1352,7 @@ func sshAgentRemoveEndpoint(info serverSSHInfo, endpoint string) error {
 	if endpoint == "" {
 		return nil
 	}
-	cmd := fmt.Sprintf(`curl -s -X POST http://localhost:9192/api/v1/endpoint -H 'Content-Type: application/json' -d '{"action":"remove","url":%q}' 2>/dev/null || true`, endpoint)
+	cmd := fmt.Sprintf(`curl -s -X POST http://localhost:59191/api/v1/endpoint -H 'Content-Type: application/json' -d '{"action":"remove","url":%q}' 2>/dev/null || true`, endpoint)
 	if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd); err != nil {
 		return fmt.Errorf("remove endpoint: %w", err)
 	}

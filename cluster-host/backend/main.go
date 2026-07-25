@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -60,6 +62,7 @@ type AlertRule struct {
 	RecipientEmail  string       `json:"recipient_email"`
 	IsActive        bool         `json:"is_active"`
 	LastTriggered   sql.NullTime `json:"last_triggered"`
+	IsFiring        bool         `json:"is_firing"`
 }
 
 type MonitoredProcess struct {
@@ -153,6 +156,7 @@ func initDatabase() {
 			recipient_email VARCHAR(255) NOT NULL,
 			is_active BOOLEAN DEFAULT TRUE,
 			last_triggered TIMESTAMP,
+			is_firing BOOLEAN DEFAULT FALSE,
 			FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
 		);`,
 		`CREATE TABLE IF NOT EXISTS recently_viewed (
@@ -177,6 +181,16 @@ func initDatabase() {
 			FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
 			CONSTRAINT unique_server_application UNIQUE(server_id, application_name)
 		);`,
+		`CREATE TABLE IF NOT EXISTS api_failure_logs (
+			id SERIAL PRIMARY KEY,
+			server_id UUID NOT NULL,
+			endpoint VARCHAR(255) NOT NULL,
+			action VARCHAR(100),
+			status_code INTEGER,
+			error_message TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+		);`,
 	}
 
 	for _, query := range createTablesQueries {
@@ -192,6 +206,26 @@ func initDatabase() {
 		`ALTER TABLE servers ADD COLUMN IF NOT EXISTS ssh_key TEXT;`,
 		`ALTER TABLE servers ADD COLUMN IF NOT EXISTS ssh_password TEXT;`,
 		`ALTER TABLE servers ADD COLUMN IF NOT EXISTS ssh_port INTEGER DEFAULT 22;`,
+		`ALTER TABLE servers ADD COLUMN IF NOT EXISTS owner_id VARCHAR(255);`,
+		`ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS is_firing BOOLEAN DEFAULT FALSE;`,
+		`CREATE TABLE IF NOT EXISTS server_members (
+			id SERIAL PRIMARY KEY,
+			server_id UUID NOT NULL,
+			username VARCHAR(255) NOT NULL,
+			role VARCHAR(50) DEFAULT 'member',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+			CONSTRAINT unique_server_member UNIQUE(server_id, username)
+		);`,
+		`CREATE TABLE IF NOT EXISTS server_access_tokens (
+			id SERIAL PRIMARY KEY,
+			server_id UUID NOT NULL,
+			token VARCHAR(255) UNIQUE NOT NULL,
+			created_by VARCHAR(255) NOT NULL,
+			expires_at TIMESTAMP,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+		);`,
 		`CREATE TABLE IF NOT EXISTS metrics_history (
 			id SERIAL PRIMARY KEY,
 			server_id UUID NOT NULL,
@@ -214,10 +248,11 @@ func initDatabase() {
 		`CREATE INDEX IF NOT EXISTS idx_monitored_services_server_id ON monitored_services(server_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_alert_rules_server_id ON alert_rules(server_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_servers_status ON servers(status);`,
+		`CREATE INDEX IF NOT EXISTS idx_server_members_user ON server_members(username);`,
 	}
 	for _, q := range migrationQueries {
 		if _, err := db.Exec(q); err != nil {
-			log.Printf("Migration notice (servers ssh columns & indexes): %v", err)
+			log.Printf("Migration notice: %v", err)
 		}
 	}
 
@@ -363,6 +398,7 @@ func bootstrapAgentOverSSH(serverID, host, osFamily, user, password, key string,
 }
 
 // Unregister Server API
+// Unregister Server API with Admin Safety & Self-Destruction
 func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -375,17 +411,46 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Capture SSH info before deletion so we can tell the agent to drop the Host endpoint.
+	session, errSession := getSession(r)
+	username := ""
+	if errSession == nil && session != nil {
+		username = session.Username
+	}
+
+	// Check admin count for this server
+	var adminCount int
+	_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND role = 'admin'", serverID).Scan(&adminCount)
+
+	var userRole string
+	_ = db.QueryRow("SELECT role FROM server_members WHERE server_id = $1 AND username = $2", serverID, username).Scan(&userRole)
+
+	// Rule: If multiple admins exist, unregistering simply revokes the calling admin's access while keeping server online
+	if adminCount > 1 && username != "" {
+		_, err := db.Exec("DELETE FROM server_members WHERE server_id = $1 AND username = $2", serverID, username)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to remove membership: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":           "membership_revoked",
+			"message":          "You have left the server. It remains active for other admins.",
+			"remaining_admins": adminCount - 1,
+		})
+		return
+	}
+
+	// Last remaining admin (or owner) unregistering: Purge server and trigger target agent self-destruction
 	sshInfo, sshErr := loadServerSSHInfo(serverID)
 
-	// Delete associated records first to prevent foreign key constraint violations
+	// Delete associated records
 	_, _ = db.Exec("DELETE FROM monitored_processes WHERE server_id = $1", serverID)
 	_, _ = db.Exec("DELETE FROM monitored_applications WHERE server_id = $1", serverID)
 	_, _ = db.Exec("DELETE FROM alert_rules WHERE server_id = $1", serverID)
 	_, _ = db.Exec("DELETE FROM recently_viewed WHERE server_id = $1", serverID)
-	_, _ = db.Exec("DELETE FROM server_history WHERE server_id = $1", serverID)
+	_, _ = db.Exec("DELETE FROM server_members WHERE server_id = $1", serverID)
+	_, _ = db.Exec("DELETE FROM server_access_tokens WHERE server_id = $1", serverID)
 
-	// Delete from servers catalog
 	res, err := db.Exec("DELETE FROM servers WHERE id = $1", serverID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to delete server: %v", err), http.StatusInternalServerError)
@@ -393,30 +458,23 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if rowsAffected == 0 {
+	if err != nil || rowsAffected == 0 {
 		http.Error(w, "Server not found", http.StatusNotFound)
 		return
 	}
 
-	// Hybrid: remove Host endpoint from the target agent asynchronously so SSH timeout never blocks HTTP response
+	// Issue self-destruct teardown payload to target agent daemon on port 59191
 	if sshErr == nil && sshInfo.Host != "127.0.0.1" && sshInfo.Host != "localhost" {
-		go func(info serverSSHInfo, ep string) {
-			if err := sshAgentRemoveEndpoint(info, ep); err != nil {
-				log.Printf("[agent-bootstrap] remove-endpoint failed for %s: %v", info.Host, err)
-			}
-		}(sshInfo, hostEndpoint)
+		go func(info serverSSHInfo) {
+			log.Printf("[agent-teardown] Sending self-destruct signal to target agent on %s", info.Host)
+			_, _ = doAgentPostRequest(info, "uninstall", nil)
+		}(sshInfo)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "unregistered",
-		"id":      serverID,
-		"message": "Server successfully unregistered. Agent endpoint removed (agent left running).",
+		"status":  "purged",
+		"message": "Server permanently unregistered and target agent uninstalled.",
 	})
 }
 
@@ -1486,7 +1544,7 @@ func handleKillApplicationControl(w http.ResponseWriter, r *http.Request) {
 func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		// List active alert rules
-		rows, err := db.Query("SELECT id, server_id, metric_type, operator, threshold, duration_minutes, recipient_email, is_active FROM alert_rules")
+		rows, err := db.Query("SELECT id, server_id, metric_type, operator, threshold, duration_minutes, recipient_email, is_active, is_firing FROM alert_rules")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -1496,7 +1554,7 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 		rules := []AlertRule{}
 		for rows.Next() {
 			var rule AlertRule
-			if err := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.IsActive); err != nil {
+			if err := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.IsActive, &rule.IsFiring); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -1515,14 +1573,34 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		session, errSession := getSession(r)
+		if errSession == nil && session.Email != "" {
+			rule.RecipientEmail = session.Email
+		}
+
 		if !uuidRegex.MatchString(rule.ServerID) || rule.MetricType == "" || rule.RecipientEmail == "" {
-			http.Error(w, "Invalid parameters", http.StatusBadRequest)
+			http.Error(w, "Invalid parameters (missing UUID, metric, or user email)", http.StatusBadRequest)
+			return
+		}
+
+		if rule.Operator == "" {
+			rule.Operator = ">"
+		}
+		validOp := false
+		for _, op := range []string{">", "<", ">=", "<=", "==", "!="} {
+			if rule.Operator == op {
+				validOp = true
+				break
+			}
+		}
+		if !validOp {
+			http.Error(w, "Invalid operator", http.StatusBadRequest)
 			return
 		}
 
 		query := `
-			INSERT INTO alert_rules (server_id, metric_type, operator, threshold, duration_minutes, recipient_email, is_active)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`
+			INSERT INTO alert_rules (server_id, metric_type, operator, threshold, duration_minutes, recipient_email, is_active, is_firing)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)`
 		_, err := db.Exec(query, rule.ServerID, rule.MetricType, rule.Operator, rule.Threshold, rule.DurationMinutes, rule.RecipientEmail, rule.IsActive)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1550,6 +1628,71 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == http.MethodPut {
+		var rule AlertRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		ruleIDStr := r.URL.Query().Get("id")
+		var ruleID int
+		var err error
+		if ruleIDStr != "" {
+			ruleID, err = strconv.Atoi(ruleIDStr)
+			if err != nil {
+				http.Error(w, "Invalid rule id in query", http.StatusBadRequest)
+				return
+			}
+		} else {
+			ruleID = rule.ID
+		}
+
+		if ruleID == 0 {
+			http.Error(w, "Missing rule id", http.StatusBadRequest)
+			return
+		}
+
+		session, errSession := getSession(r)
+		if errSession == nil && session.Email != "" {
+			rule.RecipientEmail = session.Email
+		}
+
+		if !uuidRegex.MatchString(rule.ServerID) || rule.MetricType == "" || rule.RecipientEmail == "" {
+			http.Error(w, "Invalid parameters (missing UUID, metric, or user email)", http.StatusBadRequest)
+			return
+		}
+
+		if rule.Operator == "" {
+			rule.Operator = ">"
+		}
+		validOp := false
+		for _, op := range []string{">", "<", ">=", "<=", "==", "!="} {
+			if rule.Operator == op {
+				validOp = true
+				break
+			}
+		}
+		if !validOp {
+			http.Error(w, "Invalid operator", http.StatusBadRequest)
+			return
+		}
+
+		query := `
+			UPDATE alert_rules
+			SET server_id = $1, metric_type = $2, operator = $3, threshold = $4, duration_minutes = $5, recipient_email = $6, is_active = $7, is_firing = $8
+			WHERE id = $9`
+		_, err = db.Exec(query, rule.ServerID, rule.MetricType, rule.Operator, rule.Threshold, rule.DurationMinutes, rule.RecipientEmail, rule.IsActive, rule.IsFiring, ruleID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"updated"}`))
+		return
+	}
+
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
@@ -1559,7 +1702,7 @@ func startAlertingLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	go func() {
 		for range ticker.C {
-			rows, err := db.Query("SELECT id, server_id, metric_type, operator, threshold, duration_minutes, recipient_email, last_triggered FROM alert_rules WHERE is_active = TRUE")
+			rows, err := db.Query("SELECT id, server_id, metric_type, operator, threshold, duration_minutes, recipient_email, last_triggered, is_firing FROM alert_rules WHERE is_active = TRUE")
 			if err != nil {
 				log.Printf("[AlertEngine] Error querying rules: %v", err)
 				continue
@@ -1568,7 +1711,7 @@ func startAlertingLoop() {
 			var rules []AlertRule
 			for rows.Next() {
 				var rule AlertRule
-				if scanErr := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.LastTriggered); scanErr == nil {
+				if scanErr := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.LastTriggered, &rule.IsFiring); scanErr == nil {
 					rules = append(rules, rule)
 				}
 			}
@@ -1576,11 +1719,6 @@ func startAlertingLoop() {
 
 			var wg sync.WaitGroup
 			for _, rule := range rules {
-				// Don't alert more than once every 15 minutes to avoid spamming
-				if rule.LastTriggered.Valid && time.Since(rule.LastTriggered.Time) < 15*time.Minute {
-					continue
-				}
-
 				wg.Add(1)
 				go func(r AlertRule) {
 					defer wg.Done()
@@ -1602,65 +1740,141 @@ func evaluateAlertRule(rule AlertRule) {
 	ipAddress := info.Host
 
 	var val float64
+	var found bool = false
+
 	if isDemoServer(info, rule.ServerID) {
-		// Demo server: synthesize a value near threshold occasionally
-		val = rule.Threshold - 5.0
-		_ = hostname
-		_ = ipAddress
-		// Force a benign value (no trigger) for the mock server
-		val = rule.Threshold * 0.5
+		// Mock values for the demo server
+		found = true
+		if rule.MetricType == "cpu" || rule.MetricType == "ram" || rule.MetricType == "disk" {
+			val = rule.Threshold * 0.5 // Keep it benign usually
+		} else {
+			val = rule.Threshold * 1.2 // Trigger for custom metric demo
+		}
 	} else {
 		metrics, mErr := sshGetMetrics(info)
 		if mErr != nil {
 			log.Printf("[AlertEngine] Error gathering metrics over SSH for %s: %v", info.Host, mErr)
 			return
 		}
+
 		switch rule.MetricType {
 		case "cpu":
 			if v, ok := metrics["cpu"].(float64); ok {
 				val = v
+				found = true
 			}
 		case "ram":
 			if v, ok := metrics["ram_used_pct"].(float64); ok {
 				val = v
+				found = true
 			}
 		case "disk":
 			if v, ok := metrics["disk_used_pct"].(float64); ok {
 				val = v
+				found = true
 			}
 		default:
-			return
+			// Custom metric lookup
+			if valRaw, exists := metrics[rule.MetricType]; exists {
+				switch typedVal := valRaw.(type) {
+				case float64:
+					val = typedVal
+					found = true
+				case int:
+					val = float64(typedVal)
+					found = true
+				case int64:
+					val = float64(typedVal)
+					found = true
+				case string:
+					if parsed, pErr := strconv.ParseFloat(typedVal, 64); pErr == nil {
+						val = parsed
+						found = true
+					}
+				}
+			}
 		}
 	}
 
-	// Check threshold condition
+	if !found {
+		// If metric is not found, skip evaluation to avoid false alarms
+		return
+	}
+
+	// Check condition based on comparison operators
 	triggered := false
-	if rule.Operator == ">" && val > rule.Threshold {
-		triggered = true
-	} else if rule.Operator == "<" && val < rule.Threshold {
-		triggered = true
+	switch rule.Operator {
+	case ">":
+		triggered = val > rule.Threshold
+	case "<":
+		triggered = val < rule.Threshold
+	case ">=":
+		triggered = val >= rule.Threshold
+	case "<=":
+		triggered = val <= rule.Threshold
+	case "==":
+		triggered = val == rule.Threshold
+	case "!=":
+		triggered = val != rule.Threshold
+	default:
+		triggered = val > rule.Threshold
 	}
 
 	if triggered {
-		log.Printf("[ALERT TRIGGERED] Server %s (%s) crossed %s threshold: current=%.2f%%, limit=%.2f%%",
-			hostname, ipAddress, rule.MetricType, val, rule.Threshold)
+		if !rule.IsFiring {
+			log.Printf("[ALERT TRIGGERED] Server %s (%s) crossed %s threshold: current=%.2f, limit=%s %.2f",
+				hostname, ipAddress, rule.MetricType, val, rule.Operator, rule.Threshold)
 
-		sendAlertEmail(rule, hostname, ipAddress, val)
+			sendAlertEmail(rule, hostname, ipAddress, val, false)
 
-		// Update last_triggered time
-		db.Exec("UPDATE alert_rules SET last_triggered = NOW() WHERE id = $1", rule.ID)
+			// Update state to firing
+			_, err = db.Exec("UPDATE alert_rules SET is_firing = TRUE, last_triggered = NOW() WHERE id = $1", rule.ID)
+			if err != nil {
+				log.Printf("[AlertEngine] Error setting rule %d to firing: %v", rule.ID, err)
+			}
+		} else {
+			// Already firing, check 15m cooldown to avoid spamming
+			if !rule.LastTriggered.Valid || time.Since(rule.LastTriggered.Time) >= 15*time.Minute {
+				log.Printf("[ALERT RE-TRIGGERED] Server %s (%s) remains in firing state: current=%.2f, limit=%s %.2f",
+					hostname, ipAddress, rule.MetricType, val, rule.Operator, rule.Threshold)
+
+				sendAlertEmail(rule, hostname, ipAddress, val, false)
+				_, _ = db.Exec("UPDATE alert_rules SET last_triggered = NOW() WHERE id = $1", rule.ID)
+			}
+		}
+	} else {
+		if rule.IsFiring {
+			log.Printf("[ALERT RESOLVED] Server %s (%s) condition normal: current=%.2f, limit=%s %.2f",
+				hostname, ipAddress, rule.MetricType, val, rule.Operator, rule.Threshold)
+
+			sendAlertEmail(rule, hostname, ipAddress, val, true)
+
+			// Reset firing state
+			_, err = db.Exec("UPDATE alert_rules SET is_firing = FALSE, last_triggered = NULL WHERE id = $1", rule.ID)
+			if err != nil {
+				log.Printf("[AlertEngine] Error clearing firing state for rule %d: %v", rule.ID, err)
+			}
+		}
 	}
 }
 
-func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue float64) {
+func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue float64, isResolved bool) {
 	recipient := strings.TrimSpace(rule.RecipientEmail)
 	if recipient == "" {
 		log.Printf("[AlertEngine] No recipient email configured for rule %s", rule.ID)
 		return
 	}
 
-	smtpHost := os.Getenv("SMTP_HOST")
+	rawHost := os.Getenv("SMTP_HOST")
 	smtpPort := os.Getenv("SMTP_PORT")
+	smtpHost := rawHost
+	if strings.Contains(rawHost, ":") {
+		h, p, err := net.SplitHostPort(rawHost)
+		if err == nil {
+			smtpHost = h
+			smtpPort = p
+		}
+	}
 	if smtpPort == "" {
 		smtpPort = "587"
 	}
@@ -1669,7 +1883,17 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 	if smtpPass == "" {
 		smtpPass = os.Getenv("SMTP_PASS")
 	}
+	// Strip spaces from App Passwords if present (e.g. "abky cvbw rhto rtia" -> "abkycvbwrhtortia")
+	smtpPass = strings.ReplaceAll(smtpPass, " ", "")
+
+	fromName := os.Getenv("SMTP_FROM_NAME")
+	if fromName == "" {
+		fromName = "Cluster Monitor Alerts"
+	}
 	fromEmail := os.Getenv("SMTP_FROM")
+	if fromEmail == "" {
+		fromEmail = os.Getenv("SMTP_FROM_ADDRESS")
+	}
 	if fromEmail == "" {
 		fromEmail = smtpUser
 	}
@@ -1677,20 +1901,42 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 		fromEmail = "fleet-monitor@localhost"
 	}
 
-	subject := fmt.Sprintf("CRITICAL ALERT: %s on %s (%s)", strings.ToUpper(rule.MetricType), hostname, ipAddress)
+	var subject string
+	var alertHeader string
+	var alertDetails string
+
+	if isResolved {
+		subject = fmt.Sprintf("RESOLVED: %s on %s (%s)", strings.ToUpper(rule.MetricType), hostname, ipAddress)
+		alertHeader = "<h2 style='color:#10b981;'>✅ Cluster Monitor Alert Resolved</h2>"
+		alertDetails = fmt.Sprintf(
+			"<p><strong>Server:</strong> %s (%s)</p>"+
+				"<p><strong>Metric:</strong> %s</p>"+
+				"<p><strong>Status:</strong> NORMAL (Current value <strong>%.2f</strong> is no longer %s <strong>%.2f</strong>)</p>"+
+				"<p><strong>Resolved At:</strong> %s</p>",
+			hostname, ipAddress, strings.ToUpper(rule.MetricType), currentValue, rule.Operator, rule.Threshold, time.Now().Format(time.RFC1123),
+		)
+	} else {
+		subject = fmt.Sprintf("CRITICAL ALERT: %s on %s (%s)", strings.ToUpper(rule.MetricType), hostname, ipAddress)
+		alertHeader = "<h2 style='color:#ef4444;'>🚨 Cluster Monitor Alert Triggered</h2>"
+		alertDetails = fmt.Sprintf(
+			"<p><strong>Server:</strong> %s (%s)</p>"+
+				"<p><strong>Metric:</strong> %s</p>"+
+				"<p><strong>Condition:</strong> Current value <strong>%.2f</strong> crossed threshold of <strong>%s %.2f</strong></p>"+
+				"<p><strong>Triggered At:</strong> %s</p>",
+			hostname, ipAddress, strings.ToUpper(rule.MetricType), currentValue, rule.Operator, rule.Threshold, time.Now().Format(time.RFC1123),
+		)
+	}
+
 	body := fmt.Sprintf(
-		"From: Fleet Monitor <%s>\r\n"+
+		"From: %s <%s>\r\n"+
 			"To: %s\r\n"+
 			"Subject: %s\r\n"+
 			"MIME-Version: 1.0\r\n"+
 			"Content-Type: text/html; charset=UTF-8\r\n\r\n"+
-			"<h2>🚨 Fleet Monitor Alert Triggered</h2>"+
-			"<p><strong>Server:</strong> %s (%s)</p>"+
-			"<p><strong>Metric:</strong> %s</p>"+
-			"<p><strong>Condition:</strong> Current value <strong>%.2f%%</strong> crossed threshold of <strong>%s %.2f%%</strong></p>"+
-			"<p><strong>Triggered At:</strong> %s</p>"+
-			"<hr><p style='font-size:12px; color:#888;'>This is an automated alert from Fleet Monitor.</p>",
-		fromEmail, recipient, subject, hostname, ipAddress, strings.ToUpper(rule.MetricType), currentValue, rule.Operator, rule.Threshold, time.Now().Format(time.RFC1123),
+			"%s"+
+			"%s"+
+			"<hr><p style='font-size:12px; color:#888;'>This is an automated alert from Cluster Monitor.</p>",
+		fromName, fromEmail, recipient, subject, alertHeader, alertDetails,
 	)
 
 	log.Printf("[ALERT EMAIL] Preparing alert email for %s (%s crossed %.2f%%)", recipient, hostname, rule.MetricType, currentValue)
@@ -1700,12 +1946,57 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 		return
 	}
 
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 	addr := net.JoinHostPort(smtpHost, smtpPort)
+	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
-	err := smtp.SendMail(addr, auth, fromEmail, []string{recipient}, []byte(body))
-	if err != nil {
-		log.Printf("[AlertEngine] Failed to send email to %s via %s: %v", recipient, addr, err)
+	var sendErr error
+	if smtpPort == "465" {
+		// Implicit TLS for Port 465
+		tlsconfig := &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         smtpHost,
+		}
+		conn, err := tls.Dial("tcp", addr, tlsconfig)
+		if err != nil {
+			sendErr = fmt.Errorf("TLS dial failed: %w", err)
+		} else {
+			client, err := smtp.NewClient(conn, smtpHost)
+			if err != nil {
+				sendErr = fmt.Errorf("SMTP client failed: %w", err)
+			} else {
+				if err = client.Auth(auth); err != nil {
+					sendErr = fmt.Errorf("SMTP auth failed: %w", err)
+				} else {
+					if err = client.Mail(fromEmail); err == nil {
+						if err = client.Rcpt(recipient); err == nil {
+							w, err := client.Data()
+							if err == nil {
+								_, err = w.Write([]byte(body))
+								w.Close()
+								if err == nil {
+									client.Quit()
+								} else {
+									sendErr = err
+								}
+							} else {
+								sendErr = err
+							}
+						} else {
+							sendErr = err
+						}
+					} else {
+						sendErr = err
+					}
+				}
+			}
+		}
+	} else {
+		// STARTTLS for Port 587 / 25
+		sendErr = smtp.SendMail(addr, auth, fromEmail, []string{recipient}, []byte(body))
+	}
+
+	if sendErr != nil {
+		log.Printf("[AlertEngine] Failed to send email to %s via %s: %v", recipient, addr, sendErr)
 	} else {
 		log.Printf("[AlertEngine] Successfully sent alert email to %s via SMTP (%s)", recipient, smtpHost)
 	}
@@ -1866,6 +2157,26 @@ func handleAgentIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if parts[3] == "logs" {
+		var entry struct {
+			Endpoint   string `json:"endpoint"`
+			Action     string `json:"action"`
+			StatusCode int    `json:"status_code"`
+			Error      string `json:"error"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&entry); err == nil {
+			log.Printf("[Agent Log Ingest] API failure on server %s (%s %s, status %d): %s",
+				serverID, entry.Endpoint, entry.Action, entry.StatusCode, entry.Error)
+			_, _ = db.Exec(`
+				INSERT INTO api_failure_logs (server_id, endpoint, action, status_code, error_message)
+				VALUES ($1, $2, $3, $4, $5)`,
+				serverID, entry.Endpoint, entry.Action, entry.StatusCode, entry.Error)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+
 	var m struct {
 		CPU         float64 `json:"cpu"`
 		RAMUsedPct  float64 `json:"ram_used_pct"`
@@ -1901,9 +2212,6 @@ func handleAgentIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	// Update last_seen and status in the servers table
-	_, _ = db.Exec("UPDATE servers SET status = 'online', last_seen = NOW() WHERE id = $1", serverID)
 
 	setCachedMetrics(serverID, map[string]interface{}{
 		"cpu":           m.CPU,
@@ -1981,6 +2289,43 @@ func isDockerBridgeIP(ip net.IP) bool {
 	return docker0 != nil && docker0.Contains(ip)
 }
 
+func readPreviousHostEndpoint() string {
+	if data, err := os.ReadFile("previous_endpoint.txt"); err == nil {
+		if ep := strings.TrimSpace(string(data)); ep != "" {
+			return ep
+		}
+	}
+	if data, err := os.ReadFile("/app/previous_endpoint.txt"); err == nil {
+		if ep := strings.TrimSpace(string(data)); ep != "" {
+			return ep
+		}
+	}
+	envPaths := []string{".env", "../.env", "../../.env"}
+	for _, p := range envPaths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "HOST_ENDPOINT=") {
+				val := strings.TrimPrefix(line, "HOST_ENDPOINT=")
+				val = strings.Trim(val, "\"' ")
+				if val != "" {
+					return val
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func savePreviousHostEndpoint(ep string) {
+	_ = os.WriteFile("previous_endpoint.txt", []byte(ep), 0644)
+	_ = os.WriteFile("/app/previous_endpoint.txt", []byte(ep), 0644)
+}
+
 // writeHostEndpointToEnv writes HOST_ENDPOINT into the nearest .env file so
 // docker-compose doesn't warn about the variable being blank on next start.
 func writeHostEndpointToEnv(endpoint string) {
@@ -2009,10 +2354,18 @@ func writeHostEndpointToEnv(endpoint string) {
 	}
 }
 
-// endpointBroadcastLoop periodically registers the host endpoint with every
-// registered target agent so they all know where to push metrics even when host IP changes.
+// endpointBroadcastLoop periodically checks for Host DHCP IP changes and registers the current host endpoint
+// with every registered target agent so they all replace old host IPs dynamically.
 func endpointBroadcastLoop() {
 	register := func() {
+		var payload string
+		if previousHostEndpoint != "" && previousHostEndpoint != hostEndpoint {
+			payload = fmt.Sprintf(`{"action":"replace","old_url":%q,"url":%q}`, previousHostEndpoint, hostEndpoint)
+			log.Printf("[endpoint-broadcast] Host IP change detected (%s -> %s), broadcasting replacement to targets", previousHostEndpoint, hostEndpoint)
+		} else {
+			payload = fmt.Sprintf(`{"action":"add","url":%q}`, hostEndpoint)
+		}
+
 		rows, err := db.Query(`
 			SELECT id, ip_address, COALESCE(ssh_user,''), COALESCE(ssh_key,''), COALESCE(ssh_password,''), COALESCE(ssh_port,22)
 			FROM servers`)
@@ -2022,7 +2375,7 @@ func endpointBroadcastLoop() {
 		}
 		defer rows.Close()
 		client := &http.Client{Timeout: 3 * time.Second}
-		payload := fmt.Sprintf(`{"action":"add","url":%q}`, hostEndpoint)
+
 		for rows.Next() {
 			var info serverSSHInfo
 			if err := rows.Scan(&info.ServerID, &info.Host, &info.User, &info.Key, &info.Password, &info.Port); err != nil {
@@ -2036,7 +2389,7 @@ func endpointBroadcastLoop() {
 			}
 			registered := false
 			for _, h := range hostsToTry {
-				url := fmt.Sprintf("http://%s:9192/api/v1/endpoint", h)
+				url := fmt.Sprintf("http://%s:59191/api/v1/endpoint", h)
 				resp, err := client.Post(url, "application/json", strings.NewReader(payload))
 				if err == nil && resp.StatusCode == http.StatusOK {
 					resp.Body.Close()
@@ -2051,7 +2404,7 @@ func endpointBroadcastLoop() {
 			if !registered && info.User != "" {
 				// SSH fallback
 				sshCmd := fmt.Sprintf(
-					`curl -s -X POST -H 'Content-Type: application/json' -d '%s' http://localhost:9192/api/v1/endpoint`,
+					`curl -s -X POST -H 'Content-Type: application/json' -d '%s' http://localhost:59191/api/v1/endpoint`,
 					strings.ReplaceAll(payload, "'", `'\''`),
 				)
 				_, errSSH := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, sshCmd)
@@ -2060,6 +2413,10 @@ func endpointBroadcastLoop() {
 				}
 			}
 		}
+
+		// Update previousHostEndpoint to hostEndpoint after broadcasting completes
+		previousHostEndpoint = hostEndpoint
+		savePreviousHostEndpoint(hostEndpoint)
 	}
 
 	// Run immediately on startup then every 15 seconds
@@ -2077,6 +2434,9 @@ func main() {
 	initRedis()
 	startBackgroundWorkerPool()
 
+	// Read previously saved endpoint before identifying current hostEndpoint
+	previousHostEndpoint = readPreviousHostEndpoint()
+
 	// Hybrid mode: the Host advertises its own endpoint URL so target agents
 	// (installed over SSH on register) know where to push metrics.
 	if ep := os.Getenv("HOST_ENDPOINT"); ep != "" {
@@ -2089,6 +2449,14 @@ func main() {
 		}
 		hostEndpoint = fmt.Sprintf("http://%s:%s", hostIP, port)
 	}
+
+	if previousHostEndpoint != "" && previousHostEndpoint != hostEndpoint {
+		log.Printf("[Host IP Changed] Previously: %s -> Current: %s", previousHostEndpoint, hostEndpoint)
+	} else if previousHostEndpoint == "" {
+		previousHostEndpoint = hostEndpoint
+		savePreviousHostEndpoint(hostEndpoint)
+	}
+
 	log.Printf("Hybrid mode: agents will push to %s", hostEndpoint)
 
 	// Write detected endpoint back into .env so docker-compose doesn't warn on next run.
@@ -2112,32 +2480,333 @@ func main() {
 
 	startAlertingLoop()
 
-	// Static & API Routing
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-	http.HandleFunc("/", handleRoot)
-	http.HandleFunc("/api/register", handleRegister)
-	http.HandleFunc("/api/servers", handleGetServers)
-	http.HandleFunc("/api/servers/active", handleGetActiveServers)
-	http.HandleFunc("/api/servers/unregister", handleUnregisterServer)
-	http.HandleFunc("/api/servers/detail/", handleServerDetail)
-	http.HandleFunc("/api/servers/toggle/", handleToggleService)
-	http.HandleFunc("/api/servers/control/", handleServiceControl)
-	http.HandleFunc("/api/servers/control/kill/", handleKillProcessControl)
-	http.HandleFunc("/api/servers/control/kill-by-name/", handleKillApplicationControl)
-	http.HandleFunc("/api/alerts/rules", handleAlertRules)
-	http.HandleFunc("/api/monitored/processes", handleMonitoredProcesses)
-	http.HandleFunc("/api/monitored/applications", handleMonitoredApplications)
-	http.HandleFunc("/api/ingest/", handleAgentIngest)
-	http.HandleFunc("/api/servers/test-ssh", handleTestSSH)
+	// API Routing
+	http.HandleFunc("/api/register", handleRegister) // Public for agents
+	http.HandleFunc("/api/servers", authMiddleware(handleGetServers))
+	http.HandleFunc("/api/servers/active", authMiddleware(handleGetActiveServers))
+	http.HandleFunc("/api/servers/unregister", authMiddleware(handleUnregisterServer))
+	http.HandleFunc("/api/servers/detail/", authMiddleware(handleServerDetail))
+	http.HandleFunc("/api/servers/toggle/", authMiddleware(handleToggleService))
+	http.HandleFunc("/api/servers/control/", authMiddleware(handleServiceControl))
+	http.HandleFunc("/api/servers/control/kill/", authMiddleware(handleKillProcessControl))
+	http.HandleFunc("/api/servers/control/kill-by-name/", authMiddleware(handleKillApplicationControl))
+	http.HandleFunc("/api/alerts/rules", authMiddleware(handleAlertRules))
+	http.HandleFunc("/api/monitored/processes", authMiddleware(handleMonitoredProcesses))
+	http.HandleFunc("/api/monitored/applications", authMiddleware(handleMonitoredApplications))
+	http.HandleFunc("/api/ingest/", handleAgentIngest) // Public for agents
+	http.HandleFunc("/api/servers/test-ssh", authMiddleware(handleTestSSH))
+	http.HandleFunc("/api/stream/metrics", authMiddleware(handleStreamMetrics))
+
+	// Auth Endpoints
+	http.HandleFunc("/api/auth/login", handleAuthLogin)
+	http.HandleFunc("/api/auth/github/callback", handleAuthCallback)
+	http.HandleFunc("/api/auth/logout", handleAuthLogout)
+	http.HandleFunc("/api/auth/user", handleAuthUser)
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = ":8080"
+		port = ":5000"
 	} else if !strings.HasPrefix(port, ":") {
 		port = ":" + port
 	}
 	log.Printf("Starting Host Backend on %s%s...", hostBindAddr, port)
 	if err := http.ListenAndServe(hostBindAddr+port, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
+	}
+}
+
+type UserSession struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+}
+
+func getSession(r *http.Request) (*UserSession, error) {
+	cookie, err := r.Cookie("session_id")
+	if err != nil {
+		return nil, err
+	}
+	sessionJSON, err := globalRedis.Get("session:" + cookie.Value)
+	if err != nil || sessionJSON == "" {
+		return nil, fmt.Errorf("session not found")
+	}
+	var session UserSession
+	if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
+		return nil, err
+	}
+	return &session, nil
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		// Bypass authorization for OAuth endpoints
+		if strings.HasPrefix(path, "/api/auth/") {
+			next(w, r)
+			return
+		}
+
+		// Bypass authorization for agent-facing endpoints (push-model)
+		if path == "/api/register" || strings.HasPrefix(path, "/api/ingest/") {
+			next(w, r)
+			return
+		}
+
+		// Check session
+		_, err := getSession(r)
+		if err != nil {
+			// For API endpoints, return 401 Unauthorized
+			if strings.HasPrefix(path, "/api/") {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			// For static index.html or other document views, redirect to login page
+			http.Redirect(w, r, "/static/login.html", http.StatusTemporaryRedirect)
+			return
+		}
+
+		// Prevent direct access to index.html to bypass root redirection
+		if path == "/static/index.html" {
+			http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	clientID := os.Getenv("GITHUB_CLIENT_ID")
+	if clientID == "" {
+		log.Println("[auth] Warning: GITHUB_CLIENT_ID is not configured.")
+	}
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+
+	// Dynamically build redirect URI from browser request host (e.g. localhost:8082 or 192.168.x.x:8082)
+	redirectURI := fmt.Sprintf("%s://%s/api/auth/github/callback", scheme, r.Host)
+	authURL := fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=user:email", clientID, redirectURI)
+	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
+}
+
+func handleAuthCallback(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "Missing authorization code from GitHub", http.StatusBadRequest)
+		return
+	}
+
+	clientID := os.Getenv("GITHUB_CLIENT_ID")
+	clientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
+	if clientID == "" || clientSecret == "" {
+		http.Error(w, "GitHub OAuth credentials not configured on Host", http.StatusInternalServerError)
+		return
+	}
+
+	// 1. Exchange code for access token
+	tokenURL := "https://github.com/login/oauth/access_token"
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("client_secret", clientSecret)
+	form.Set("code", code)
+
+	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		http.Error(w, "Failed to create token exchange request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		Scope       string `json:"scope"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		http.Error(w, "Failed to parse token response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if tokenResp.AccessToken == "" {
+		http.Error(w, "Access token was empty. Check credentials.", http.StatusUnauthorized)
+		return
+	}
+
+	// 2. Fetch User Profile
+	userReq, err := http.NewRequest(http.MethodGet, "https://api.github.com/user", nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	userReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+	userReq.Header.Set("Accept", "application/json")
+
+	userResp, err := client.Do(userReq)
+	if err != nil {
+		http.Error(w, "Failed to retrieve user profile: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer userResp.Body.Close()
+
+	var githubUser struct {
+		Login string `json:"login"`
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(userResp.Body).Decode(&githubUser); err != nil {
+		http.Error(w, "Failed to decode user profile: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 3. Fetch User Emails to find primary verified email
+	emailReq, err := http.NewRequest(http.MethodGet, "https://api.github.com/user/emails", nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	emailReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+	emailReq.Header.Set("Accept", "application/json")
+
+	emailResp, err := client.Do(emailReq)
+	if err != nil {
+		http.Error(w, "Failed to retrieve emails: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer emailResp.Body.Close()
+
+	type GitHubEmail struct {
+		Email    string `json:"email"`
+		Primary  bool   `json:"primary"`
+		Verified bool   `json:"verified"`
+	}
+	var githubEmails []GitHubEmail
+	if err := json.NewDecoder(emailResp.Body).Decode(&githubEmails); err != nil {
+		log.Printf("[auth] Warning: Failed to parse emails list: %v", err)
+	}
+
+	primaryEmail := githubUser.Email
+	for _, e := range githubEmails {
+		if e.Primary {
+			primaryEmail = e.Email
+			break
+		}
+	}
+	if primaryEmail == "" && len(githubEmails) > 0 {
+		primaryEmail = githubEmails[0].Email
+	}
+	if primaryEmail == "" {
+		primaryEmail = fmt.Sprintf("%s@users.noreply.github.com", githubUser.Login)
+	}
+
+	// 4. Save session in Redis (expires in 24 hours)
+	sessionID := uuid.New().String()
+	sessionData := UserSession{
+		Username: githubUser.Login,
+		Email:    primaryEmail,
+	}
+	sessionBytes, err := json.Marshal(sessionData)
+	if err != nil {
+		http.Error(w, "Failed to serialize session", http.StatusInternalServerError)
+		return
+	}
+
+	err = globalRedis.SetEX("session:"+sessionID, string(sessionBytes), 86400)
+	if err != nil {
+		http.Error(w, "Failed to save session in cache", http.StatusInternalServerError)
+		return
+	}
+
+	// 5. Set session cookie and redirect to root dashboard
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   86400,
+	})
+
+	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+}
+
+func handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("session_id")
+	if err == nil && cookie.Value != "" {
+		_ = globalRedis.Del("session:" + cookie.Value)
+	}
+
+	// Evict cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+
+	http.Redirect(w, r, "/static/login.html", http.StatusTemporaryRedirect)
+}
+
+func handleAuthUser(w http.ResponseWriter, r *http.Request) {
+	session, err := getSession(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(session)
+}
+
+func handleStreamMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	serverID := r.URL.Query().Get("server_id")
+	channel := "metrics_stream_global"
+	if serverID != "" {
+		channel = "metrics_stream:" + serverID
+	}
+
+	if globalRedis == nil || globalRedis.client == nil {
+		http.Error(w, "Redis PubSub unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	pubsub := globalRedis.client.Subscribe(r.Context(), channel)
+	defer pubsub.Close()
+
+	ch := pubsub.Channel()
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case msg, open := <-ch:
+			if !open {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", msg.Payload)
+			flusher.Flush()
+		}
 	}
 }

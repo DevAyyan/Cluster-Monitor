@@ -1,5 +1,96 @@
 // Components module for Fleet Monitor UI (Modal, Tab Managers, Containers, Processes, Applications, Alerts, Logs)
 
+// Toast Notification System
+const activeToastSet = new Set();
+let rulesCache = {};
+
+function showToast(title, message, type = 'error', duration = 6000) {
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        container.className = 'toast-container';
+        document.body.appendChild(container);
+    }
+
+    const toastKey = `${type}:${title}:${message}`;
+    if (activeToastSet.has(toastKey)) return;
+    activeToastSet.add(toastKey);
+
+    const toast = document.createElement('div');
+    toast.className = `toast-item ${type}`;
+
+    let iconClass = 'fa-solid fa-circle-exclamation';
+    if (type === 'error') iconClass = 'fa-solid fa-triangle-exclamation';
+    if (type === 'warning') iconClass = 'fa-solid fa-circle-exclamation';
+    if (type === 'success') iconClass = 'fa-solid fa-circle-check';
+    if (type === 'info') iconClass = 'fa-solid fa-circle-info';
+
+    toast.innerHTML = `
+        <i class="${iconClass} toast-icon"></i>
+        <div class="toast-body">
+            <div class="toast-title">${escapeHtml(title)}</div>
+            <div class="toast-message">${escapeHtml(message)}</div>
+        </div>
+        <button class="toast-close" onclick="dismissToast(this.parentElement, '${toastKey}')"><i class="fa-solid fa-xmark"></i></button>
+    `;
+
+    container.appendChild(toast);
+
+    if (duration > 0) {
+        setTimeout(() => {
+            dismissToast(toast, toastKey);
+        }, duration);
+    }
+}
+
+function dismissToast(toastEl, toastKey) {
+    if (toastKey) activeToastSet.delete(toastKey);
+    if (!toastEl) return;
+    toastEl.style.opacity = '0';
+    toastEl.style.transform = 'translateX(40px)';
+    setTimeout(() => {
+        if (toastEl.parentNode) toastEl.parentNode.removeChild(toastEl);
+    }, 300);
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+async function fetchWithErrorHandling(url, options = {}, errorTitle = "API Request Failed") {
+    try {
+        const resp = await fetch(url, options);
+        if (!resp.ok) {
+            let errorMsg = `HTTP Status ${resp.status} (${resp.statusText || 'Server Error'})`;
+            try {
+                const data = await resp.clone().json();
+                if (data && data.error) {
+                    errorMsg = data.error;
+                } else if (data && data.message) {
+                    errorMsg = data.message;
+                }
+            } catch (e) {
+                try {
+                    const text = await resp.clone().text();
+                    if (text && text.trim() && text.length < 250) errorMsg = text.trim();
+                } catch (e2) {}
+            }
+            showToast(errorTitle, errorMsg, 'error');
+        }
+        return resp;
+    } catch (err) {
+        showToast(errorTitle, err.message || 'Network connectivity failure or host server unreachable.', 'error');
+        throw err;
+    }
+}
+
 // Global state variables
 let currentActiveServer = null;
 let cachedProcesses = [];
@@ -883,22 +974,22 @@ async function sendSignalToProcess(pid, name) {
     if (!confirm(`Are you sure you want to send "${signal.toUpperCase()}" to process "${name}" (PID: ${pid})?`)) return;
 
     try {
-        const resp = await fetch(`/api/servers/control/kill/${currentActiveServer}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pid: String(pid), signal: signal })
-        });
+        const resp = await fetchWithErrorHandling(
+            `/api/servers/control/kill/${currentActiveServer}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pid: String(pid), signal: signal })
+            },
+            `Process Signal (${signal.toUpperCase()}) Failed`
+        );
 
-        if (resp.ok) {
-            alert(`Successfully sent signal ${signal.toUpperCase()} to PID ${pid}.`);
+        if (resp && resp.ok) {
+            showToast('Signal Sent', `Successfully sent ${signal.toUpperCase()} to ${name} (PID: ${pid}).`, 'success', 4000);
             fetchServerProcesses();
-        } else {
-            const text = await resp.text();
-            alert(`Failed to send signal: ${text}`);
         }
     } catch (e) {
         console.error("Error sending signal to process:", e);
-        alert("Error connecting to host backend.");
     }
 }
 
@@ -907,21 +998,21 @@ async function sendSignalToApplication(name) {
     const signal = selectEl ? selectEl.value : 'kill';
     if (!confirm(`Are you sure you want to send "${signal.toUpperCase()}" to all processes of application "${name}"?`)) return;
     try {
-        const resp = await fetch(`/api/servers/control/kill-by-name/${currentActiveServer}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: name, signal: signal })
-        });
-        if (resp.ok) {
-            alert(`Successfully sent signal ${signal.toUpperCase()} to application ${name}.`);
+        const resp = await fetchWithErrorHandling(
+            `/api/servers/control/kill-by-name/${currentActiveServer}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: name, signal: signal })
+            },
+            `Application Signal (${signal.toUpperCase()}) Failed`
+        );
+        if (resp && resp.ok) {
+            showToast('Signal Sent', `Successfully sent ${signal.toUpperCase()} to application ${name}.`, 'success', 4000);
             fetchServerApplications();
-        } else {
-            const text = await resp.text();
-            alert(`Failed to send signal: ${text}`);
         }
     } catch (e) {
         console.error("Error sending signal to application:", e);
-        alert("Error connecting to host backend.");
     }
 }
 
@@ -1266,12 +1357,13 @@ async function fetchServerLogs() {
 async function fetchServerNetworks() {
     if (!currentActiveServer) return;
     const targetServerId = currentActiveServer;
-    const netBody = document.getElementById('networks-list-body');
+    const cardsGrid = document.getElementById('network-cards-grid');
     const connBody = document.getElementById('network-connections-list-body');
-    if (!netBody) return;
-    const isLiveRefresh = netBody.querySelector('tr') !== null && !netBody.innerText.includes('Loading');
+    if (!cardsGrid) return;
+
+    const isLiveRefresh = cardsGrid.querySelector('.iface-card') !== null;
     if (!isLiveRefresh) {
-        netBody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:20px; opacity:0.5;"><i class="fa-solid fa-spinner fa-spin"></i> Loading network interfaces...</td></tr>';
+        cardsGrid.innerHTML = '<div style="grid-column: 1/-1; text-align:center; padding:20px; opacity:0.5;"><i class="fa-solid fa-spinner fa-spin"></i> Loading network interface cards...</div>';
         if (connBody) connBody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:20px; opacity:0.5;"><i class="fa-solid fa-spinner fa-spin"></i> Loading active socket connections...</td></tr>';
     }
     
@@ -1286,24 +1378,43 @@ async function fetchServerNetworks() {
         }
         const interfaces = await resp.json();
         if (currentActiveServer === targetServerId) {
-            netBody.innerHTML = '';
-            const nNotice = sshFallbackNotice(resp);
-            if (nNotice) netBody.insertAdjacentHTML('afterbegin', nNotice);
+            cardsGrid.innerHTML = '';
             if (!Array.isArray(interfaces) || interfaces.length === 0) {
-                netBody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:20px; opacity:0.5;">No network interfaces found.</td></tr>';
+                cardsGrid.innerHTML = '<div style="grid-column: 1/-1; text-align:center; padding:20px; opacity:0.5;">No active network interfaces found.</div>';
             } else {
+                let validCount = 0;
                 interfaces.forEach(i => {
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td style="font-weight:600; color:var(--text-primary);">${i.name || i.Name || 'N/A'}</td>
-                        <td style="font-family:var(--font-mono);">${i.ip || i.IP || 'N/A'}</td>
-                        <td style="font-family:var(--font-mono);">${i.rxSpeed || 'Active'}</td>
-                        <td style="font-family:var(--font-mono);">${i.txSpeed || 'Active'}</td>
-                        <td style="font-family:var(--font-mono);">${i.rxTotal || 'Calculated live'}</td>
-                        <td style="font-family:var(--font-mono);">${i.txTotal || 'Calculated live'}</td>
+                    const ifName = i.name || i.Name || 'N/A';
+                    const ifIp = i.ip || i.IP || 'N/A';
+                    const ifMac = i.mac || i.MAC || 'N/A';
+                    const ifRx = i.rxTotal || '0 B';
+                    const ifTx = i.txTotal || '0 B';
+
+                    const isLoopback = ifName === 'lo' || ifName.startsWith('lo') || ifIp.startsWith('127.') || ifIp === '::1';
+                    const hasNA = ifName === 'N/A' || ifIp === 'N/A' || ifMac === 'N/A' || ifRx === 'N/A' || ifTx === 'N/A';
+
+                    if (isLoopback || hasNA) {
+                        return; // Skip loopback and any items containing N/A values
+                    }
+
+                    validCount++;
+
+                    const card = document.createElement('div');
+                    card.className = 'iface-card';
+                    card.style.cssText = 'background:var(--bg-card); border:1px solid var(--border-color); border-radius:12px; padding:16px;';
+                    card.innerHTML = `
+                        <h4 style="font-family:var(--font-mono); font-size:14px; margin-bottom:10px; color:var(--primary); font-weight:600;"><i class="fa-solid fa-network-wired" style="font-size:12px; margin-right:6px;"></i>${escapeHtml(ifName)}</h4>
+                        <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-secondary); padding:4px 0;"><span>IP Address</span><span style="font-family:var(--font-mono); color:var(--text-primary); font-weight:500;">${escapeHtml(ifIp)}</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-secondary); padding:4px 0;"><span>MAC Address</span><span style="font-family:var(--font-mono); color:var(--text-primary); font-weight:500;">${escapeHtml(ifMac)}</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-secondary); padding:4px 0;"><span>RX Total</span><span style="font-family:var(--font-mono); color:var(--text-primary); font-weight:500;">${escapeHtml(ifRx)}</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-secondary); padding:4px 0;"><span>TX Total</span><span style="font-family:var(--font-mono); color:var(--text-primary); font-weight:500;">${escapeHtml(ifTx)}</span></div>
                     `;
-                    netBody.appendChild(row);
+                    cardsGrid.appendChild(card);
                 });
+
+                if (validCount === 0) {
+                    cardsGrid.innerHTML = '<div style="grid-column: 1/-1; text-align:center; padding:20px; opacity:0.5;">No active physical/virtual network interfaces found.</div>';
+                }
             }
         }
 
@@ -1396,6 +1507,9 @@ async function renderGlobalAlerts() {
         const rulesResp = await fetch('/api/alerts/rules');
         const rules = await rulesResp.json();
         
+        // Cache rules
+        rules.forEach(r => { rulesCache[r.id] = r; });
+
         const serversResp = await fetch('/api/servers');
         const servers = await serversResp.json();
         const sMap = {};
@@ -1418,6 +1532,7 @@ async function renderGlobalAlerts() {
                 <td>${r.recipient_email}</td>
                 <td><span class="badge ${r.is_active ? 'badge-success' : 'badge-danger'}">${r.is_active ? 'Active' : 'Muted'}</span></td>
                 <td>
+                    <button onclick="editAlertRule('${r.id}')" style="background-color: var(--primary); border: none; color: white; padding: 5px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; margin-right: 5px;"><i class="fa-solid fa-edit"></i> Edit</button>
                     <button onclick="deleteGlobalAlertRule('${r.id}')" style="background-color: var(--danger); border: none; color: white; padding: 5px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;"><i class="fa-solid fa-trash"></i> Delete</button>
                 </td>
             `;
@@ -1442,28 +1557,30 @@ async function deleteGlobalAlertRule(ruleId) {
     }
 }
 
-async function registerAlertRule(serverId, metric, threshold, duration, email) {
+async function registerAlertRule(serverId, metric, operator, threshold, duration, email) {
     try {
-        const resp = await fetch('/api/alerts/rules', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                server_id: serverId,
-                metric_type: metric,
-                operator: '>',
-                threshold: threshold,
-                duration_minutes: duration,
-                recipient_email: email,
-                is_active: true
-            })
-        });
+        const resp = await fetchWithErrorHandling(
+            '/api/alerts/rules', 
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    server_id: serverId,
+                    metric_type: metric,
+                    operator: operator,
+                    threshold: threshold,
+                    duration_minutes: duration,
+                    recipient_email: email,
+                    is_active: true
+                })
+            },
+            'Alert Rule Registration Failed'
+        );
 
-        if (resp.ok) {
-            alert("Alert rule successfully registered!");
+        if (resp && resp.ok) {
+            showToast('Alert Rule Registered', `Alert rule for ${metric.toUpperCase()} ${operator} ${threshold}% registered successfully.`, 'success', 4000);
             if (typeof fetchDashboardData === 'function') fetchDashboardData();
             if (currentActiveServer === serverId) updateRulesList(serverId);
-        } else {
-            alert("Failed to register alert rule.");
         }
     } catch (err) {
         console.error("Failed to add alert rule:", err);
@@ -1473,9 +1590,13 @@ async function registerAlertRule(serverId, metric, threshold, duration, email) {
 async function deleteAlertRule(ruleId) {
     if (!confirm("Are you sure you want to delete this alert rule?")) return;
     try {
-        const resp = await fetch(`/api/alerts/rules?id=${ruleId}`, { method: 'DELETE' });
-        if (resp.ok) {
-            alert("Alert rule deleted successfully.");
+        const resp = await fetchWithErrorHandling(
+            `/api/alerts/rules?id=${ruleId}`, 
+            { method: 'DELETE' },
+            'Alert Rule Deletion Failed'
+        );
+        if (resp && resp.ok) {
+            showToast('Alert Rule Deleted', 'Alert rule removed successfully.', 'info', 3000);
             if (typeof fetchDashboardData === 'function') fetchDashboardData();
             if (currentActiveServer) updateRulesList(currentActiveServer);
         }
@@ -1491,6 +1612,9 @@ async function updateRulesList(serverId) {
         const resp = await fetch('/api/alerts/rules');
         const rules = await resp.json();
 
+        // Cache rules
+        rules.forEach(r => { rulesCache[r.id] = r; });
+
         const serverRules = rules.filter(r => r.server_id === serverId);
         configuredRulesContainer.innerHTML = '';
 
@@ -1504,9 +1628,10 @@ async function updateRulesList(serverId) {
             item.className = 'rule-item';
             item.innerHTML = `
                 <span><strong>${rule.metric_type.toUpperCase()}</strong> ${rule.operator} ${rule.threshold}% (${rule.duration_minutes}m)</span>
-                <div style="display:flex; align-items:center; gap:12px;">
-                    <span style="opacity: 0.7; font-size:12px;">${rule.recipient_email}</span>
-                    <button class="rule-delete-btn" onclick="deleteAlertRule(${rule.id})"><i class="fa-solid fa-trash"></i></button>
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <span style="opacity: 0.7; font-size:12px; margin-right: 4px;">${rule.recipient_email}</span>
+                    <button class="rule-edit-btn" onclick="editAlertRule(${rule.id})" style="background: var(--primary); border: none; color: white; border-radius: 4px; padding: 4px 6px; font-size: 11px; cursor: pointer; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px;"><i class="fa-solid fa-edit"></i></button>
+                    <button class="rule-delete-btn" onclick="deleteAlertRule(${rule.id})" style="width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;"><i class="fa-solid fa-trash"></i></button>
                 </div>
             `;
             configuredRulesContainer.appendChild(item);
@@ -1636,14 +1761,18 @@ async function executeServerUnregister() {
     }
 
     try {
-        const resp = await fetch(`/api/servers/unregister?id=${encodeURIComponent(serverToDelete)}`, { method: 'DELETE' });
-        let res = {};
-        try { res = await resp.json(); } catch(e) {}
+        const resp = await fetchWithErrorHandling(
+            `/api/servers/unregister?id=${encodeURIComponent(serverToDelete)}`, 
+            { method: 'DELETE' },
+            'Deregister Node Failed'
+        );
 
-        if (resp.ok || resp.status === 200 || resp.status === 204) {
+        if (resp && (resp.ok || resp.status === 200 || resp.status === 204)) {
             closeUnregisterConfirmModal();
             closeDetailsModal();
             
+            showToast('Node Deregistered', `Server node '${serverName}' removed from fleet catalog.`, 'info', 4000);
+
             // Delete from local cache and DOM immediately
             delete serversMap[serverToDelete];
             const card = document.getElementById(`server-card-${serverToDelete}`);
@@ -1651,12 +1780,9 @@ async function executeServerUnregister() {
 
             if (typeof fetchDashboardData === 'function') fetchDashboardData();
             if (typeof renderSettingsView === 'function') renderSettingsView();
-        } else {
-            alert(`Failed to unregister server (${resp.status}): ${res.message || res.error || 'Unknown error'}`);
         }
     } catch (e) {
         console.error("Error unregistering server:", e);
-        alert("Error unregistering server: " + e.message);
     } finally {
         if (btn) {
             btn.disabled = false;
@@ -1675,6 +1801,75 @@ window.executeServerUnregister = executeServerUnregister;
 window.openServerDetails = openServerDetails;
 window.closeDetailsModal = closeDetailsModal;
 window.manualRefreshSystem = manualRefreshSystem;
+window.switchMainView = switchMainView;
+window.renderSettingsView = renderSettingsView;
+window.deleteGlobalAlertRule = deleteGlobalAlertRule;
+window.handleRegisterServerSettings = handleRegisterServerSettings;
+
+function switchMainView(viewName) {
+    const menuIds = ['sidebar-menu-dashboard', 'sidebar-menu-alerts', 'sidebar-menu-settings'];
+    menuIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            if (id === `sidebar-menu-${viewName}`) {
+                el.classList.add('active');
+            } else {
+                el.classList.remove('active');
+            }
+        }
+    });
+
+    const viewIds = ['dashboard-view', 'alerts-view', 'settings-view'];
+    viewIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            if (id === `${viewName}-view`) {
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+    });
+
+    if (viewName === 'alerts') {
+        renderGlobalAlerts();
+    } else if (viewName === 'settings') {
+        renderSettingsView();
+    }
+}
+
+async function renderSettingsView() {
+    const body = document.getElementById('settings-servers-list-body');
+    if (!body) return;
+    body.innerHTML = '<tr><td colspan="4" style="text-align: center; padding: 20px; opacity: 0.5;">Loading registered nodes...</td></tr>';
+    try {
+        const resp = await fetch('/api/servers');
+        if (!resp.ok) throw new Error(`HTTP error ${resp.status}`);
+        const servers = await resp.json();
+        
+        body.innerHTML = '';
+        if (servers.length === 0) {
+            body.innerHTML = '<tr><td colspan="4" style="text-align: center; padding: 20px; opacity: 0.5;">No registered nodes in the fleet catalog.</td></tr>';
+            return;
+        }
+
+        servers.forEach(s => {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td style="padding: 12px; border-bottom: 1px solid var(--border-color); font-weight: 600; color: var(--text-primary);">${s.hostname}</td>
+                <td style="padding: 12px; border-bottom: 1px solid var(--border-color); font-family: var(--font-mono);">${s.ip_address}</td>
+                <td style="padding: 12px; border-bottom: 1px solid var(--border-color); text-transform: capitalize;">${s.os_family}</td>
+                <td style="padding: 12px; border-bottom: 1px solid var(--border-color);">
+                    <button onclick="deleteServer('${s.id}')" style="background-color: var(--danger); border: none; color: white; padding: 5px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;"><i class="fa-solid fa-trash"></i> Delete</button>
+                </td>
+            `;
+            body.appendChild(row);
+        });
+    } catch (err) {
+        body.innerHTML = `<tr><td colspan="4" style="text-align: center; padding: 20px; color: var(--danger);">Failed to load registered nodes: ${err.message}</td></tr>`;
+    }
+}
+
 
 async function handleRegisterServerSettings(event) {
     event.preventDefault();
@@ -1688,35 +1883,163 @@ async function handleRegisterServerSettings(event) {
     const sshKey = document.getElementById('set-reg-ssh-key').value;
 
     if (!hostname || !ip || !sshUser || (!sshKey && !sshPassword)) {
-        alert("Hostname, IP address, SSH user and (private key or password) are all required to register a server.");
+        showToast('Form Validation Error', 'Hostname, IP address, SSH user and (private key or password) are required.', 'warning', 5000);
         return;
     }
 
     try {
-        const resp = await fetch('/api/register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                hostname: hostname,
-                ip_address: ip,
-                os_family: os,
-                ssh_user: sshUser,
-                ssh_password: sshPassword,
-                ssh_port: sshPort,
-                ssh_key: sshKey
-            })
-        });
+        const resp = await fetchWithErrorHandling(
+            '/api/register', 
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    hostname: hostname,
+                    ip_address: ip,
+                    os_family: os,
+                    ssh_user: sshUser,
+                    ssh_password: sshPassword,
+                    ssh_port: sshPort,
+                    ssh_key: sshKey
+                })
+            },
+            'Server Registration Failed'
+        );
 
-        if (resp.ok) {
-            alert("Server registered successfully!");
+        if (resp && resp.ok) {
+            showToast('Server Registered', `Server '${hostname}' registered successfully to fleet catalog.`, 'success', 4000);
             document.getElementById('settings-register-form').reset();
             renderSettingsView();
             if (typeof fetchDashboardData === 'function') fetchDashboardData();
-        } else {
-            const text = await resp.json();
-            alert("Failed to register server: " + (text.message || text));
         }
     } catch (err) {
-        alert("Error registering server: " + err.message);
+        console.error("Error registering server:", err);
+    }
+}
+
+window.editAlertRule = editAlertRule;
+window.closeEditAlertModal = closeEditAlertModal;
+window.handleEditAlertSubmit = handleEditAlertSubmit;
+window.onAlertMetricChange = onAlertMetricChange;
+
+function onAlertMetricChange(selectEl, prefix) {
+    const customGroup = document.getElementById(`${prefix}alert-metric-custom-group`);
+    if (customGroup) {
+        if (selectEl.value === 'custom') {
+            customGroup.style.display = 'block';
+        } else {
+            customGroup.style.display = 'none';
+        }
+    }
+}
+
+function editAlertRule(ruleId) {
+    const rule = rulesCache[ruleId];
+    if (!rule) return;
+
+    const serverObj = serversMap[rule.server_id];
+    const serverName = serverObj ? serverObj.hostname : 'Unknown Node';
+
+    document.getElementById('edit-alert-id').value = rule.id;
+    document.getElementById('edit-alert-server-id').value = rule.server_id;
+    document.getElementById('edit-alert-server').value = serverName;
+
+    const isCustomMetric = !['cpu', 'ram', 'disk'].includes(rule.metric_type);
+    const metricSelect = document.getElementById('edit-alert-metric');
+    const customGroup = document.getElementById('edit-alert-metric-custom-group');
+    const customInput = document.getElementById('edit-alert-metric-custom');
+
+    if (isCustomMetric) {
+        metricSelect.value = 'custom';
+        customInput.value = rule.metric_type;
+        if (customGroup) customGroup.style.display = 'block';
+    } else {
+        metricSelect.value = rule.metric_type;
+        customInput.value = '';
+        if (customGroup) customGroup.style.display = 'none';
+    }
+
+    document.getElementById('edit-alert-operator').value = rule.operator || '>';
+    document.getElementById('edit-alert-threshold').value = rule.threshold;
+    document.getElementById('edit-alert-duration').value = rule.duration_minutes;
+    document.getElementById('edit-alert-email').value = rule.recipient_email;
+    document.getElementById('edit-alert-active').checked = rule.is_active;
+
+    const modal = document.getElementById('edit-alert-modal');
+    if (modal) {
+        modal.style.display = 'flex';
+        modal.classList.add('open');
+    }
+}
+
+function closeEditAlertModal() {
+    const modal = document.getElementById('edit-alert-modal');
+    if (modal) {
+        modal.style.display = 'none';
+        modal.classList.remove('open');
+    }
+}
+
+async function handleEditAlertSubmit(event) {
+    event.preventDefault();
+    const id = document.getElementById('edit-alert-id').value;
+    const serverId = document.getElementById('edit-alert-server-id').value;
+    let metric = document.getElementById('edit-alert-metric').value;
+    if (metric === 'custom') {
+        metric = document.getElementById('edit-alert-metric-custom').value.trim();
+        if (!metric) {
+            showToast('Form Validation Error', 'Custom metric key is required.', 'warning', 4000);
+            return;
+        }
+    }
+    const operator = document.getElementById('edit-alert-operator').value;
+    const threshold = parseFloat(document.getElementById('edit-alert-threshold').value);
+    const duration = parseInt(document.getElementById('edit-alert-duration').value);
+    const email = document.getElementById('edit-alert-email').value.trim();
+    const isActive = document.getElementById('edit-alert-active').checked;
+
+    if (!id || !serverId || !metric || !email || isNaN(threshold) || isNaN(duration)) {
+        showToast('Form Validation Error', 'All fields are required.', 'warning', 5000);
+        return;
+    }
+
+    const rule = rulesCache[id] || {};
+    const isFiring = rule.is_firing || false;
+
+    try {
+        const resp = await fetchWithErrorHandling(
+            `/api/alerts/rules?id=${id}`,
+            {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: parseInt(id),
+                    server_id: serverId,
+                    metric_type: metric,
+                    operator: operator,
+                    threshold: threshold,
+                    duration_minutes: duration,
+                    recipient_email: email,
+                    is_active: isActive,
+                    is_firing: isFiring
+                })
+            },
+            'Failed to Update Alert Rule'
+        );
+
+        if (resp && resp.ok) {
+            showToast('Alert Rule Updated', 'The alert rule has been successfully updated.', 'success', 4000);
+            closeEditAlertModal();
+            // Refresh views
+            if (typeof fetchDashboardData === 'function') fetchDashboardData();
+            if (currentActiveServer) updateRulesList(currentActiveServer);
+            // Also refresh global alerts view in case it's open
+            const alertsView = document.getElementById('alerts-view');
+            if (alertsView && alertsView.style.display !== 'none') {
+                renderGlobalAlerts();
+            }
+        }
+    } catch (err) {
+        console.error("Error updating alert rule:", err);
     }
 }

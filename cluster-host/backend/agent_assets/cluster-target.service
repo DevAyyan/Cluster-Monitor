@@ -11,7 +11,7 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/etc/cluster-target
+ReadWritePaths=/etc/cluster-target /var/run/docker.sock /run/docker.sock
 AmbientCapabilities=CAP_NET_RAW
 
 [Install]

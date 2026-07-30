@@ -42,11 +42,19 @@ function initApp() {
         procSearch.addEventListener('input', filterProcesses);
     }
 
+    const appSearch = document.getElementById('app-search');
+    if (appSearch) {
+        appSearch.addEventListener('input', filterApplications);
+    }
+
     const createAlertForm = document.getElementById('create-alert-form');
     if (createAlertForm) {
         createAlertForm.addEventListener('submit', (e) => {
             e.preventDefault();
             if (!currentActiveServer) return;
+
+            const targetType = document.getElementById('alert-target-type').value;
+            const targetValue = document.getElementById('alert-target-value').value.trim();
 
             let metric = document.getElementById('alert-metric').value;
             if (metric === 'custom') {
@@ -59,9 +67,16 @@ function initApp() {
             const operator = document.getElementById('alert-operator').value;
             const threshold = parseFloat(document.getElementById('alert-threshold').value);
             const duration = parseInt(document.getElementById('alert-duration').value);
-            const email = document.getElementById('alert-email').value;
+            const recipientType = document.getElementById('alert-recipient-type').value;
+            let email = document.getElementById('alert-email').value || '';
+            if (recipientType === 'self') email = window.currentUserEmail || '';
+            if (recipientType === 'all') email = '';
+            if (recipientType === 'specific' && !email.trim()) {
+                showToast('Validation Error', 'Please select at least one user to notify.', 'warning', 4000);
+                return;
+            }
 
-            registerAlertRule(currentActiveServer, metric, operator, threshold, duration, email);
+            registerAlertRule(currentActiveServer, metric, operator, threshold, duration, email, targetType, targetValue, recipientType);
         });
     }
 
@@ -108,6 +123,17 @@ async function fetchUserProfile() {
             return;
         }
         const user = await resp.json();
+        window.currentUserUsername = user.username;
+        window.currentUserEmail = user.email;
+        
+        try {
+            localStorage.setItem('rememberedUser', JSON.stringify({
+                username: user.username,
+                email: user.email
+            }));
+        } catch(e) {
+            console.error("Failed to write rememberedUser", e);
+        }
         
         // Populate sidebar footer
         const profileName = document.getElementById('user-profile-name');
@@ -115,11 +141,14 @@ async function fetchUserProfile() {
         if (profileName) profileName.textContent = user.username;
         if (profileEmail) profileEmail.textContent = user.email;
 
-        // Populate forms
-        const alertEmail = document.getElementById('alert-email');
-        const editAlertEmail = document.getElementById('edit-alert-email');
-        if (alertEmail) alertEmail.value = user.email;
-        if (editAlertEmail) editAlertEmail.value = user.email;
+        // Populate alert email display
+        const alertDisplay = document.getElementById('alert-email-display');
+        const editAlertDisplay = document.getElementById('edit-alert-email-display');
+        if (alertDisplay) alertDisplay.value = user.email;
+        if (editAlertDisplay) editAlertDisplay.value = user.email;
+        // Set initial recipient type to 'self'
+        const rtSelect = document.getElementById('alert-recipient-type');
+        if (rtSelect) onAlertRecipientTypeChange(rtSelect, 'create-');
     } catch (err) {
         console.error("Failed to fetch user profile:", err);
     }
@@ -283,12 +312,18 @@ function renderDashboardCardMetrics(serverId, metrics) {
                 card.className = 'active-card';
                 card.onclick = () => openServerDetails(server.id);
                 card.innerHTML = `
-                    <div class="active-card-header">
-                        <div class="active-card-title">
-                            <h3><div class="server-status-dot online"></div> ${server.hostname}</h3>
+                    <div class="active-card-header" style="display: flex; justify-content: space-between; align-items: flex-start; width: 100%;">
+                        <div class="active-card-title" style="flex: 1; min-width: 0;">
+                            <h3 style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"><div class="server-status-dot online"></div> ${server.hostname}</h3>
                             <p>${server.ip_address} &bull; ${server.os_family.toUpperCase()}</p>
                         </div>
-                        <span class="active-os-badge online" style="background-color: var(--primary-glow); color: var(--primary); font-weight:600; font-size: 11px; padding: 4px 8px; border-radius: 4px;"><i class="fa-solid fa-circle" style="font-size:7px; margin-right:4px;"></i> Online</span>
+                        <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0;">
+                            <span class="active-os-badge online" style="background-color: var(--primary-glow); color: var(--primary); font-weight:600; font-size: 11px; padding: 4px 8px; border-radius: 4px;"><i class="fa-solid fa-circle" style="font-size:7px; margin-right:4px;"></i> Online</span>
+                            <div style="display: flex; gap: 5px; align-items: center; margin-top: 2px;">
+                                <span style="font-size: 10px; font-weight: 700; color: var(--text-secondary); background: rgba(255,255,255,0.06); padding: 3px 6px; border-radius: 4px; text-transform: uppercase; border: 1px solid var(--border-color);">${server.role || 'viewer'}</span>
+                                <button onclick="event.stopPropagation(); openTeamModal('${server.id}', '${server.hostname}')" style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); color: var(--primary); font-size: 10px; font-weight: 700; padding: 3px 6px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; gap: 3px; transition: all 0.2s;" onmouseover="this.style.background='rgba(56, 189, 248, 0.15)'" onmouseout="this.style.background='rgba(56, 189, 248, 0.08)'"><i class="fa-solid fa-users"></i> Team</button>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="sparkline-container">

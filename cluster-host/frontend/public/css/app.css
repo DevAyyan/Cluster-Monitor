@@ -680,6 +680,7 @@ header {
     flex-direction: column;
     gap: 2px;
     flex-shrink: 0;
+    overflow-y: auto;
 }
 
 .tab-btn {

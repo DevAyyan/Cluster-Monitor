@@ -1,10 +1,30 @@
 // Components module for Fleet Monitor UI (Modal, Tab Managers, Containers, Processes, Applications, Alerts, Logs)
 
+// Centralized fetch interceptor to handle session expiration (401 Unauthorized)
+(function() {
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+        try {
+            const resp = await originalFetch(...args);
+            if (resp.status === 401) {
+                const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
+                if (url && url.includes('/api/') && !url.includes('/api/auth/login') && !url.includes('/api/auth/github/callback') && !url.includes('/api/auth/logout')) {
+                    console.warn("Session expired or invalid (401 Unauthorized). Redirecting to login page...");
+                    window.location.href = '/static/login.html';
+                }
+            }
+            return resp;
+        } catch (err) {
+            throw err;
+        }
+    };
+})();
+
 // Toast Notification System
 const activeToastSet = new Set();
 let rulesCache = {};
 
-function showToast(title, message, type = 'error', duration = 6000) {
+function showToast(title, message, type = 'error', duration = 6000, allowHtml = false) {
     let container = document.getElementById('toast-container');
     if (!container) {
         container = document.createElement('div');
@@ -30,7 +50,7 @@ function showToast(title, message, type = 'error', duration = 6000) {
         <i class="${iconClass} toast-icon"></i>
         <div class="toast-body">
             <div class="toast-title">${escapeHtml(title)}</div>
-            <div class="toast-message">${escapeHtml(message)}</div>
+            <div class="toast-message">${allowHtml ? message : escapeHtml(message)}</div>
         </div>
         <button class="toast-close" onclick="dismissToast(this.parentElement, '${toastKey}')"><i class="fa-solid fa-xmark"></i></button>
     `;
@@ -94,6 +114,7 @@ async function fetchWithErrorHandling(url, options = {}, errorTitle = "API Reque
 // Global state variables
 let currentActiveServer = null;
 let cachedProcesses = [];
+let cachedApplications = [];
 let resourceUpdateInterval = null;
 let serversMap = {};
 let latestMetricsMap = {};
@@ -124,10 +145,49 @@ function sshFallbackNotice(resp) {
     return '';
 }
 
+function clearServerDetailsUI() {
+    const fields = [
+        'sys-uptime', 'sys-tcp-conns', 'sys-udp-conns',
+        'cpu-value', 'ram-value', 'swap-value', 'disk-value',
+        'cpu-cores-list', 'applications-list-body', 'proc-list-body',
+        'fs-list-body', 'containers-list-body', 'docker-images-list-body',
+        'system-logs-terminal', 'network-cards-grid', 'network-connections-list-body',
+        'configured-rules-container', 'command-sets-container', 'cmd-log-body'
+    ];
+    fields.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            if (id.endsWith('-terminal')) {
+                el.innerText = 'Loading...';
+            } else if (id.endsWith('-body') || id.endsWith('-list') || id.endsWith('-grid')) {
+                el.innerHTML = '';
+            } else if (id.endsWith('-container')) {
+                el.innerHTML = '<p style="font-size:13px; color:var(--text-secondary); padding:20px; text-align:center;">Loading...</p>';
+            } else {
+                el.innerText = 'Loading...';
+            }
+        }
+    });
+
+    ['cpu-circle', 'ram-circle', 'swap-circle', 'disk-circle'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.style.strokeDashoffset = '282.6';
+        }
+    });
+
+    ['proc-search', 'app-search', 'cmd-search'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
+}
+
 function closeDetailsModal() {
     const modalOverlay = document.getElementById('modal-overlay');
     if (modalOverlay) modalOverlay.classList.remove('open');
     currentActiveServer = null;
+    // Reset cached role so it's re-fetched fresh for the next server opened
+    window.currentUserRole = null;
     if (resourceUpdateInterval) {
         clearInterval(resourceUpdateInterval);
         resourceUpdateInterval = null;
@@ -136,7 +196,9 @@ function closeDetailsModal() {
         clearInterval(liveTabRefreshInterval);
         liveTabRefreshInterval = null;
     }
+    clearServerDetailsUI();
 }
+
 
 function switchTab(tabId, btnEl) {
     document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
@@ -161,6 +223,7 @@ function switchTab(tabId, btnEl) {
     else if (tabId === 'logs-tab') fetchServerLogs();
     else if (tabId === 'networks-tab') fetchServerNetworks();
     else if (tabId === 'filesystems-tab') fetchServerStorage(currentActiveServer);
+    else if (tabId === 'commands-tab') fetchServerCommands();
     else if (tabId === 'history-tab') {
         resizeHistoryCharts();
         fetchServerHistory();
@@ -296,6 +359,59 @@ async function openServerDetails(serverId) {
         fetchServerContainers();
         fetchServerLogs();
         fetchServerNetworks();
+        // NOTE: fetchServerCommands() is called by switchTab when the user navigates to commands-tab.
+        // Calling it here when that tab is not active causes a role-fetch race condition.
+
+        // Fetch user's role on this server, then configure alert form options accordingly
+        try {
+            const membersResp = await fetch(`/api/servers/members?id=${serverId}`);
+            if (membersResp.ok) {
+                const membersData = await membersResp.json();
+                const userRole = membersData.current_user_role || 'viewer';
+                window.currentUserRole = userRole;
+
+                // Update alert recipient dropdown options based on role
+                // Admins can send to Everyone; non-admins only to self or specific users
+                const rtSelectCreate = document.getElementById('alert-recipient-type');
+                const rtSelectEdit = document.getElementById('edit-alert-recipient-type');
+                [rtSelectCreate, rtSelectEdit].forEach(sel => {
+                    if (!sel) return;
+                    // Remove existing "all" option if present
+                    const existingAll = sel.querySelector('option[value="all"]');
+                    if (userRole === 'admin') {
+                        if (!existingAll) {
+                            const allOpt = document.createElement('option');
+                            allOpt.value = 'all';
+                            allOpt.textContent = 'Everyone (all team members)';
+                            // Insert after first option
+                            sel.insertBefore(allOpt, sel.options[1]);
+                        }
+                    } else {
+                        if (existingAll) existingAll.remove();
+                    }
+                });
+
+                // Show/hide create-alert form based on role (admin or operator can create)
+                const canManageAlerts = userRole === 'admin' || userRole === 'operator';
+                const createAlertCard = document.getElementById('create-alert-card');
+                const viewerNotice = document.getElementById('alert-viewer-notice');
+                if (createAlertCard) createAlertCard.style.display = canManageAlerts ? '' : 'none';
+                if (viewerNotice) viewerNotice.style.display = canManageAlerts ? 'none' : 'block';
+
+                // Pre-fill email display immediately with current user's email
+                const emailDisplay = document.getElementById('alert-email-display');
+                const editEmailDisplay = document.getElementById('edit-alert-email-display');
+                if (emailDisplay && !emailDisplay.value) emailDisplay.value = window.currentUserEmail || '';
+                if (editEmailDisplay && !editEmailDisplay.value) editEmailDisplay.value = window.currentUserEmail || '';
+
+                // Ensure recipient type defaults to "self" and triggers the display update
+                if (rtSelectCreate && rtSelectCreate.value === 'self' && typeof onAlertRecipientTypeChange === 'function') {
+                    onAlertRecipientTypeChange(rtSelectCreate, 'create-');
+                }
+            }
+        } catch (e) {
+            console.warn('Could not fetch server member role:', e);
+        }
 
         updateTelemetryMetrics(server);
         if (resourceUpdateInterval) clearInterval(resourceUpdateInterval);
@@ -938,17 +1054,7 @@ function renderProcesses(processes) {
             <td style="font-family:var(--font-mono);">${netDown} KB/s</td>
             <td style="font-family:var(--font-mono);">${netUp} KB/s</td>
             <td>
-                <div style="display: flex; align-items: center; gap: 6px;">
-                    <select id="sig-select-${pid}" onchange="processSignalCache['${pid}'] = this.value" style="background-color: #1a1a24; color: #a9b1d6; border: 1px solid var(--border-color); border-radius: 4px; padding: 4px 6px; font-size: 11px; outline: none; cursor: pointer;">
-                        <option value="kill" ${savedSig === 'kill' ? 'selected' : ''}>Kill (SIGKILL)</option>
-                        <option value="terminate" ${savedSig === 'terminate' ? 'selected' : ''}>Terminate (SIGTERM)</option>
-                        <option value="suspend" ${savedSig === 'suspend' ? 'selected' : ''}>Suspend (SIGSTOP)</option>
-                        <option value="continue" ${savedSig === 'continue' ? 'selected' : ''}>Continue (SIGCONT)</option>
-                        <option value="hangup" ${savedSig === 'hangup' ? 'selected' : ''}>Hangup (SIGHUP)</option>
-                        <option value="interrupt" ${savedSig === 'interrupt' ? 'selected' : ''}>Interrupt (SIGINT)</option>
-                    </select>
-                    <button class="rule-delete-btn" onclick="sendSignalToProcess('${pid}', '${name}')" style="color: var(--danger); padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05); cursor: pointer; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Send Signal"><i class="fa-solid fa-paper-plane"></i> Send</button>
-                </div>
+                <button onclick="navigateToAddAlert('process', '${name}')" style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); color: var(--primary); font-size: 10px; font-weight: 700; padding: 4px 8px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; gap: 3px; transition: all 0.2s;" onmouseover="this.style.background='rgba(56, 189, 248, 0.15)'" onmouseout="this.style.background='rgba(56, 189, 248, 0.08)'"><i class="fa-solid fa-bell"></i> Add Alert</button>
             </td>
         `;
         procListBody.appendChild(row);
@@ -1065,63 +1171,73 @@ async function fetchServerApplications() {
             net_up: (Math.random() * 40 + 0.1).toFixed(1)
         }));
 
-        appBody.innerHTML = '';
-        if (appList.length === 0) {
-            appBody.innerHTML = '<tr><td colspan="10" style="text-align:center; padding:20px; opacity:0.5;">No applications detected.</td></tr>';
-            return;
+        cachedApplications = appList;
+        renderApplications(appList);
+
+        const appSearch = document.getElementById('app-search');
+        if (appSearch && appSearch.value.trim() !== '') {
+            filterApplications();
         }
-
-        appList.sort((a, b) => b.cpu - a.cpu);
-        appList.forEach(app => {
-            const row = document.createElement('tr');
-            const cpuColor = app.cpu > 50 ? 'var(--danger)' : (app.cpu > 25 ? 'var(--warning)' : 'var(--text-primary)');
-            const appName = app.name.replace(/'/g, "\\'");
-            
-            const isMonitored = monitoredAppNames.has(app.name.toLowerCase());
-
-            const leftIndicator = isMonitored 
-                ? `<span title="Monitored" style="color:#c084fc; font-size:13px;"><i class="fa-solid fa-eye"></i></span>` 
-                : `<span style="opacity:0.25;">•</span>`;
-
-            const checkboxHtml = applicationMonitoringMode 
-                ? `<input type="checkbox" class="application-checkbox" data-app="${appName}" ${selectedApplications.has(app.name) ? 'checked' : ''} onchange="toggleApplicationSelection('${appName}')">` 
-                : leftIndicator;
-
-            const monitoredBadge = isMonitored ? `<span title="Monitored" style="color:#c084fc; margin-right:6px; font-size:11px;"><i class="fa-solid fa-eye"></i></span>` : '';
-
-            const savedSig = appSignalCache[appName] || 'kill';
-
-            row.innerHTML = `
-                <td style="text-align:center; width:36px;">${checkboxHtml}</td>
-                <td><strong><i class="fa-solid fa-cube" style="color: var(--primary); margin-right: 8px;"></i>${app.name}</strong></td>
-                <td style="text-align:center;">${app.instances}</td>
-                <td style="font-weight:500; color:${cpuColor};">${app.cpu.toFixed(1)}%</td>
-                <td>${app.memory.toFixed(1)} MB</td>
-                <td style="font-family:var(--font-mono);">${app.disk_read} KB/s</td>
-                <td style="font-family:var(--font-mono);">${app.disk_write} KB/s</td>
-                <td style="font-family:var(--font-mono);">${app.net_down} KB/s</td>
-                <td style="font-family:var(--font-mono);">${app.net_up} KB/s</td>
-                <td>
-                    <div style="display: flex; align-items: center; gap: 6px;">
-                        <select id="app-sig-select-${appName}" onchange="appSignalCache['${appName}'] = this.value" style="background-color: #1a1a24; color: #a9b1d6; border: 1px solid var(--border-color); border-radius: 4px; padding: 4px 6px; font-size: 11px; outline: none; cursor: pointer;">
-                            <option value="kill" ${savedSig === 'kill' ? 'selected' : ''}>Kill (SIGKILL)</option>
-                            <option value="terminate" ${savedSig === 'terminate' ? 'selected' : ''}>Terminate (SIGTERM)</option>
-                            <option value="suspend" ${savedSig === 'suspend' ? 'selected' : ''}>Suspend (SIGSTOP)</option>
-                            <option value="continue" ${savedSig === 'continue' ? 'selected' : ''}>Continue (SIGCONT)</option>
-                            <option value="hangup" ${savedSig === 'hangup' ? 'selected' : ''}>Hangup (SIGHUP)</option>
-                            <option value="interrupt" ${savedSig === 'interrupt' ? 'selected' : ''}>Interrupt (SIGINT)</option>
-                        </select>
-                        <button class="rule-delete-btn" onclick="sendSignalToApplication('${appName}')" style="color: var(--danger); padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05); cursor: pointer; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Send Signal"><i class="fa-solid fa-paper-plane"></i> Send</button>
-                    </div>
-                </td>
-            `;
-            appBody.appendChild(row);
-        });
     } catch (err) {
         if (currentActiveServer !== targetServerId) return;
         appBody.innerHTML = `<tr><td colspan="10" style="text-align:center; padding:20px; color:var(--danger);">Error: ${err.message}</td></tr>`;
     }
 }
+
+function renderApplications(appList) {
+    const appBody = document.getElementById('applications-list-body');
+    if (!appBody) return;
+    appBody.innerHTML = '';
+    if (appList.length === 0) {
+        appBody.innerHTML = '<tr><td colspan="10" style="text-align:center; padding:20px; opacity:0.5;">No applications detected.</td></tr>';
+        return;
+    }
+
+    const sortedList = [...appList].sort((a, b) => b.cpu - a.cpu);
+    sortedList.forEach(app => {
+        const row = document.createElement('tr');
+        const cpuColor = app.cpu > 50 ? 'var(--danger)' : (app.cpu > 25 ? 'var(--warning)' : 'var(--text-primary)');
+        const appName = app.name.replace(/'/g, "\\'");
+        
+        const isMonitored = monitoredAppNames.has(app.name.toLowerCase());
+
+        const leftIndicator = isMonitored 
+            ? `<span title="Monitored" style="color:#c084fc; font-size:13px;"><i class="fa-solid fa-eye"></i></span>` 
+            : `<span style="opacity:0.25;">•</span>`;
+
+        const checkboxHtml = applicationMonitoringMode 
+            ? `<input type="checkbox" class="application-checkbox" data-app="${appName}" ${selectedApplications.has(app.name) ? 'checked' : ''} onchange="toggleApplicationSelection('${appName}')">` 
+            : leftIndicator;
+
+        row.innerHTML = `
+            <td style="text-align:center; width:36px;">${checkboxHtml}</td>
+            <td><strong><i class="fa-solid fa-cube" style="color: var(--primary); margin-right: 8px;"></i>${app.name}</strong></td>
+            <td style="text-align:center;">${app.instances}</td>
+            <td style="font-weight:500; color:${cpuColor};">${app.cpu.toFixed(1)}%</td>
+            <td>${app.memory.toFixed(1)} MB</td>
+            <td style="font-family:var(--font-mono);">${app.disk_read} KB/s</td>
+            <td style="font-family:var(--font-mono);">${app.disk_write} KB/s</td>
+            <td style="font-family:var(--font-mono);">${app.net_down} KB/s</td>
+            <td style="font-family:var(--font-mono);">${app.net_up} KB/s</td>
+            <td>
+                <button onclick="navigateToAddAlert('application', '${appName}')" style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); color: var(--primary); font-size: 10px; font-weight: 700; padding: 4px 8px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; gap: 3px; transition: all 0.2s;" onmouseover="this.style.background='rgba(56, 189, 248, 0.15)'" onmouseout="this.style.background='rgba(56, 189, 248, 0.08)'"><i class="fa-solid fa-bell"></i> Add Alert</button>
+            </td>
+        `;
+        appBody.appendChild(row);
+    });
+}
+
+function filterApplications() {
+    const appSearch = document.getElementById('app-search');
+    if (!appSearch) return;
+    const query = appSearch.value.toLowerCase();
+    const filtered = cachedApplications.filter(app => {
+        const appName = (app.name || '').toLowerCase();
+        return appName.includes(query);
+    });
+    renderApplications(filtered);
+}
+
 
 async function fetchServerContainers() {
     if (!currentActiveServer) return;
@@ -1502,44 +1618,71 @@ async function fetchServerHistory() {
 async function renderGlobalAlerts() {
     const body = document.getElementById('global-rules-list-body');
     if (!body) return;
-    body.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px; opacity: 0.5;">Loading active alert rules...</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px; opacity: 0.5;">Loading alert rules...</td></tr>';
     try {
         const rulesResp = await fetch('/api/alerts/rules');
-        const rules = await rulesResp.json();
-        
+        const allRules = await rulesResp.json();
+
         // Cache rules
-        rules.forEach(r => { rulesCache[r.id] = r; });
+        allRules.forEach(r => { rulesCache[r.id] = r; });
 
         const serversResp = await fetch('/api/servers');
         const servers = await serversResp.json();
         const sMap = {};
-        servers.forEach(s => { sMap[s.id] = s.hostname; });
+        const roleMap = {};
+        servers.forEach(s => { 
+            sMap[s.id] = s.hostname; 
+            roleMap[s.id] = s.role;
+        });
+
+        const myEmail = (window.currentUserEmail || '').toLowerCase();
+
+        // Only show rules that are relevant to the current user:
+        // - recipient_type === 'self' (targeted at the creator, i.e. me)
+        // - recipient_type === 'all' (broadcast — affects everyone)
+        // - recipient_type === 'specific' and recipient_email contains my email
+        const rules = allRules.filter(r => {
+            if (r.recipient_type === 'all') return true;
+            if (r.recipient_type === 'self') return true;
+            if (r.recipient_type === 'specific' && myEmail) {
+                const emails = (r.recipient_email || '').toLowerCase().split(',').map(e => e.trim());
+                return emails.includes(myEmail);
+            }
+            return false;
+        });
 
         body.innerHTML = '';
         if (rules.length === 0) {
-            body.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px; opacity: 0.5;">No active alert rules configured in the fleet.</td></tr>';
+            body.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px; opacity: 0.5;">No alert rules relevant to your account are configured.</td></tr>';
             return;
         }
 
         rules.forEach(r => {
             const row = document.createElement('tr');
+            const role = roleMap[r.server_id] || 'viewer';
+            const canEdit = role === 'admin' || role === 'operator' || role === 'member';
+
             row.innerHTML = `
-                <td style="font-weight: 600; color: var(--text-primary);">${sMap[r.server_id] || 'Unknown Node'}</td>
-                <td style="text-transform: uppercase;">${r.metric_type}</td>
-                <td>${r.operator || '>'}</td>
-                <td style="font-family: var(--font-mono);">${r.threshold}%</td>
+                <td style="font-weight: 600; color: var(--text-primary);">${escapeHtml(sMap[r.server_id] || 'Unknown Node')}</td>
+                <td colspan="3">${getRuleDescription(r)}</td>
                 <td style="font-family: var(--font-mono);">${r.duration_minutes} min</td>
-                <td>${r.recipient_email}</td>
+                <td>${r.recipient_type === 'all' ? '\uD83D\uDC65 Everyone' : r.recipient_type === 'self' ? '\uD83D\uDC64 Me' : '\uD83D\uDCE7 ' + escapeHtml(r.recipient_email)}</td>
                 <td><span class="badge ${r.is_active ? 'badge-success' : 'badge-danger'}">${r.is_active ? 'Active' : 'Muted'}</span></td>
                 <td>
+                    ${canEdit ? `
                     <button onclick="editAlertRule('${r.id}')" style="background-color: var(--primary); border: none; color: white; padding: 5px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; margin-right: 5px;"><i class="fa-solid fa-edit"></i> Edit</button>
                     <button onclick="deleteGlobalAlertRule('${r.id}')" style="background-color: var(--danger); border: none; color: white; padding: 5px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;"><i class="fa-solid fa-trash"></i> Delete</button>
+                    ` : `
+                    <button disabled style="background-color: var(--primary); border: none; color: white; padding: 5px 10px; border-radius: 4px; font-size: 11px; opacity: 0.4; cursor: not-allowed; margin-right: 5px;" title="Only admins/operators can edit"><i class="fa-solid fa-edit"></i> Edit</button>
+                    <button disabled style="background-color: var(--danger); border: none; color: white; padding: 5px 10px; border-radius: 4px; font-size: 11px; opacity: 0.4; cursor: not-allowed;" title="Only admins/operators can delete"><i class="fa-solid fa-trash"></i> Delete</button>
+                    `}
                 </td>
             `;
             body.appendChild(row);
         });
+
     } catch (err) {
-        body.innerHTML = `<tr><td colspan="8" style="text-align: center; padding: 20px; color: var(--danger);">Failed to load alert rules: ${err.message}</td></tr>`;
+        body.innerHTML = `<tr><td colspan="8" style="text-align: center; padding: 20px; color: var(--danger);">Failed to load alert rules: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
 
@@ -1557,28 +1700,37 @@ async function deleteGlobalAlertRule(ruleId) {
     }
 }
 
-async function registerAlertRule(serverId, metric, operator, threshold, duration, email) {
+async function registerAlertRule(serverId, metric, operator, threshold, duration, email, targetType = 'server', targetValue = '', recipientType = 'self') {
     try {
+        const payload = {
+            server_id: serverId,
+            metric_type: metric,
+            operator: operator,
+            threshold: isNaN(threshold) ? 0 : threshold,
+            duration_minutes: duration,
+            recipient_email: email,
+            recipient_type: recipientType,
+            is_active: true,
+            target_type: targetType,
+            target_value: targetValue
+        };
+        if (metric === 'process_down') {
+            payload.operator = '==';
+            payload.threshold = 0;
+        }
+
         const resp = await fetchWithErrorHandling(
             '/api/alerts/rules', 
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    server_id: serverId,
-                    metric_type: metric,
-                    operator: operator,
-                    threshold: threshold,
-                    duration_minutes: duration,
-                    recipient_email: email,
-                    is_active: true
-                })
+                body: JSON.stringify(payload)
             },
             'Alert Rule Registration Failed'
         );
 
         if (resp && resp.ok) {
-            showToast('Alert Rule Registered', `Alert rule for ${metric.toUpperCase()} ${operator} ${threshold}% registered successfully.`, 'success', 4000);
+            showToast('Alert Rule Registered', `Alert rule registered successfully.`, 'success', 4000);
             if (typeof fetchDashboardData === 'function') fetchDashboardData();
             if (currentActiveServer === serverId) updateRulesList(serverId);
         }
@@ -1605,12 +1757,118 @@ async function deleteAlertRule(ruleId) {
     }
 }
 
+function onAlertRecipientTypeChange(select, prefix) {
+    const val = select.value;
+    const emailGroup = document.getElementById(prefix + 'alert-email-group');
+    const displayGroup = document.getElementById(prefix + 'alert-email-display-group');
+    const displayInput = document.getElementById(prefix + 'alert-email-display');
+
+    // 'Specific user(s)' search group (replaces old email input)
+    if (emailGroup) emailGroup.style.display = val === 'specific' ? 'block' : 'none';
+
+    // 'Alert will be sent to:' readonly box — ONLY shown when recipient is 'Me'
+    if (displayGroup) displayGroup.style.display = val === 'self' ? 'block' : 'none';
+    if (val === 'self' && displayInput) displayInput.value = window.currentUserEmail || '';
+    if (val === 'all' && displayInput) displayInput.value = 'All team members';
+}
+
+// Tracks selected alert users per form prefix
+const alertSelectedUsers = { 'create-': {}, 'edit-': {} };
+
+let _alertUserSearchTimer = null;
+async function searchAlertUser(inputEl, prefix) {
+    const query = inputEl.value.trim();
+    const resultsEl = document.getElementById(prefix + 'alert-user-results');
+    if (!resultsEl) return;
+
+    clearTimeout(_alertUserSearchTimer);
+    _alertUserSearchTimer = setTimeout(async () => {
+        try {
+            // First search server members who match
+            let candidates = [];
+            if (currentActiveServer) {
+                const membResp = await fetch(`/api/servers/members?id=${currentActiveServer}`);
+                if (membResp.ok) {
+                    const membData = await membResp.json();
+                    candidates = (membData.members || []).filter(m =>
+                        !query || (m.username && m.username.toLowerCase().includes(query.toLowerCase()))
+                    );
+                }
+            }
+
+            resultsEl.innerHTML = '';
+            if (candidates.length === 0) {
+                resultsEl.innerHTML = '<div style="padding:8px 12px; font-size:12px; color:var(--text-secondary);">No users found</div>';
+                resultsEl.style.display = 'block';
+                return;
+            }
+
+            candidates.forEach(u => {
+                const item = document.createElement('div');
+                item.style.cssText = 'display:flex; align-items:center; gap:8px; padding:7px 12px; cursor:pointer; font-size:13px; border-bottom:1px solid var(--border-color); transition: background 0.15s;';
+                item.onmouseover = () => item.style.background = 'rgba(255,255,255,0.05)';
+                item.onmouseout = () => item.style.background = '';
+                const avatarSrc = `https://github.com/${u.username}.png?size=24`;
+                item.innerHTML = `<img src="${avatarSrc}" style="width:22px; height:22px; border-radius:50%;" onerror="this.src='https://github.com/identicons/${escapeHtml(u.username)}.png'"><span>${escapeHtml(u.username)}</span>${u.email ? `<span style="opacity:0.5; font-size:11px;">(${escapeHtml(u.email)})</span>` : ''}`;
+                item.onclick = () => {
+                    addAlertUserTag(prefix, u.username, u.email || '');
+                    resultsEl.style.display = 'none';
+                    inputEl.value = '';
+                };
+                resultsEl.appendChild(item);
+            });
+            resultsEl.style.display = 'block';
+        } catch (e) {
+            resultsEl.style.display = 'none';
+        }
+    }, 150);
+}
+
+
+function addAlertUserTag(prefix, username, email) {
+    if (!alertSelectedUsers[prefix]) alertSelectedUsers[prefix] = {};
+    if (alertSelectedUsers[prefix][username]) return; // already added
+    alertSelectedUsers[prefix][username] = email;
+    renderAlertUserTags(prefix);
+    updateAlertEmailHidden(prefix);
+}
+
+function removeAlertUserTag(prefix, username) {
+    if (alertSelectedUsers[prefix]) delete alertSelectedUsers[prefix][username];
+    renderAlertUserTags(prefix);
+    updateAlertEmailHidden(prefix);
+}
+
+function renderAlertUserTags(prefix) {
+    const tagsEl = document.getElementById(prefix + 'alert-user-tags');
+    if (!tagsEl) return;
+    tagsEl.innerHTML = '';
+    const users = alertSelectedUsers[prefix] || {};
+    Object.entries(users).forEach(([uname, uemail]) => {
+        const tag = document.createElement('div');
+        tag.style.cssText = 'display:inline-flex; align-items:center; gap:5px; background:var(--primary); color:white; padding:3px 8px 3px 6px; border-radius:20px; font-size:12px; font-weight:600;';
+        tag.innerHTML = `<img src="https://github.com/${escapeHtml(uname)}.png?size=18" style="width:16px; height:16px; border-radius:50%;" onerror="this.src='https://github.com/identicons/${escapeHtml(uname)}.png'"><span>${escapeHtml(uname)}</span><button onclick="removeAlertUserTag('${escapeHtml(prefix)}', '${escapeHtml(uname)}')" style="background:none; border:none; color:white; cursor:pointer; font-size:14px; line-height:1; padding:0; margin-left:2px; opacity:0.8;">×</button>`;
+        tagsEl.appendChild(tag);
+    });
+}
+
+function updateAlertEmailHidden(prefix) {
+    const hiddenEl = document.getElementById((prefix === 'create-' ? '' : prefix) + 'alert-email');
+    if (!hiddenEl) return;
+    const users = alertSelectedUsers[prefix] || {};
+    // Collect emails — if a user has no email in DB, store their username so backend can look it up
+    const emailList = Object.entries(users).map(([uname, uemail]) => uemail || `@${uname}`).join(',');
+    hiddenEl.value = emailList;
+}
+
 async function updateRulesList(serverId) {
     const configuredRulesContainer = document.getElementById('configured-rules-container');
     if (!configuredRulesContainer) return;
     try {
         const resp = await fetch('/api/alerts/rules');
+        if (currentActiveServer !== serverId) return;
         const rules = await resp.json();
+        if (currentActiveServer !== serverId) return;
 
         // Cache rules
         rules.forEach(r => { rulesCache[r.id] = r; });
@@ -1627,9 +1885,13 @@ async function updateRulesList(serverId) {
             const item = document.createElement('div');
             item.className = 'rule-item';
             item.innerHTML = `
-                <span><strong>${rule.metric_type.toUpperCase()}</strong> ${rule.operator} ${rule.threshold}% (${rule.duration_minutes}m)</span>
+                <div style="display:flex; flex-direction:column; gap:2px;">
+                    <span>${getRuleDescription(rule)} (${rule.duration_minutes}m)</span>
+                    <span style="opacity: 0.6; font-size:11px;">
+                        ${rule.recipient_type === 'all' ? '👥 Everyone' : rule.recipient_type === 'self' ? '👤 Me' : '📧 ' + rule.recipient_email}
+                    </span>
+                </div>
                 <div style="display:flex; align-items:center; gap:8px;">
-                    <span style="opacity: 0.7; font-size:12px; margin-right: 4px;">${rule.recipient_email}</span>
                     <button class="rule-edit-btn" onclick="editAlertRule(${rule.id})" style="background: var(--primary); border: none; color: white; border-radius: 4px; padding: 4px 6px; font-size: 11px; cursor: pointer; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px;"><i class="fa-solid fa-edit"></i></button>
                     <button class="rule-delete-btn" onclick="deleteAlertRule(${rule.id})" style="width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;"><i class="fa-solid fa-trash"></i></button>
                 </div>
@@ -1792,6 +2054,14 @@ async function executeServerUnregister() {
     }
 }
 
+function manualRefreshSystem() {
+    if (!currentActiveServer) return;
+    const server = serversMap[currentActiveServer];
+    if (server) {
+        updateTelemetryMetrics(server);
+    }
+}
+
 // Global window exposure for inline onclick handlers
 window.unregisterCurrentServer = unregisterCurrentServer;
 window.deleteServer = deleteServer;
@@ -1805,6 +2075,9 @@ window.switchMainView = switchMainView;
 window.renderSettingsView = renderSettingsView;
 window.deleteGlobalAlertRule = deleteGlobalAlertRule;
 window.handleRegisterServerSettings = handleRegisterServerSettings;
+window.searchAlertUser = searchAlertUser;
+window.removeAlertUserTag = removeAlertUserTag;
+window.onAlertRecipientTypeChange = onAlertRecipientTypeChange;
 
 function switchMainView(viewName) {
     const menuIds = ['sidebar-menu-dashboard', 'sidebar-menu-alerts', 'sidebar-menu-settings'];
@@ -1925,11 +2198,21 @@ window.onAlertMetricChange = onAlertMetricChange;
 function onAlertMetricChange(selectEl, prefix) {
     const customGroup = document.getElementById(`${prefix}alert-metric-custom-group`);
     if (customGroup) {
-        if (selectEl.value === 'custom') {
+        if (selectEl && selectEl.value === 'custom') {
             customGroup.style.display = 'block';
         } else {
             customGroup.style.display = 'none';
         }
+    }
+    
+    const operatorGroup = document.getElementById(`${prefix}alert-operator-group`);
+    const thresholdGroup = document.getElementById(`${prefix}alert-threshold-group`);
+    if (selectEl && selectEl.value === 'process_down') {
+        if (operatorGroup) operatorGroup.style.display = 'none';
+        if (thresholdGroup) thresholdGroup.style.display = 'none';
+    } else {
+        if (operatorGroup) operatorGroup.style.display = 'block';
+        if (thresholdGroup) thresholdGroup.style.display = 'block';
     }
 }
 
@@ -1944,25 +2227,64 @@ function editAlertRule(ruleId) {
     document.getElementById('edit-alert-server-id').value = rule.server_id;
     document.getElementById('edit-alert-server').value = serverName;
 
-    const isCustomMetric = !['cpu', 'ram', 'disk'].includes(rule.metric_type);
+    const type = rule.target_type || 'server';
+    const typeSelect = document.getElementById('edit-alert-target-type');
+    if (typeSelect) {
+        typeSelect.value = type;
+        onAlertTargetTypeChange(typeSelect, 'edit-');
+    }
+    
+    const valInput = document.getElementById('edit-alert-target-value');
+    if (valInput) {
+        valInput.value = rule.target_value || '';
+    }
+
     const metricSelect = document.getElementById('edit-alert-metric');
     const customGroup = document.getElementById('edit-alert-metric-custom-group');
     const customInput = document.getElementById('edit-alert-metric-custom');
 
-    if (isCustomMetric) {
-        metricSelect.value = 'custom';
-        customInput.value = rule.metric_type;
-        if (customGroup) customGroup.style.display = 'block';
+    if (type === 'server') {
+        const isCustomMetric = !['cpu', 'ram', 'disk'].includes(rule.metric_type);
+        if (isCustomMetric) {
+            metricSelect.value = 'custom';
+            customInput.value = rule.metric_type;
+            if (customGroup) customGroup.style.display = 'block';
+        } else {
+            metricSelect.value = rule.metric_type;
+            customInput.value = '';
+            if (customGroup) customGroup.style.display = 'none';
+        }
     } else {
         metricSelect.value = rule.metric_type;
         customInput.value = '';
         if (customGroup) customGroup.style.display = 'none';
     }
+    onAlertMetricChange(metricSelect, 'edit-');
 
     document.getElementById('edit-alert-operator').value = rule.operator || '>';
-    document.getElementById('edit-alert-threshold').value = rule.threshold;
+    document.getElementById('edit-alert-threshold').value = rule.threshold || '';
     document.getElementById('edit-alert-duration').value = rule.duration_minutes;
-    document.getElementById('edit-alert-email').value = rule.recipient_email;
+    const rt = rule.recipient_type || 'self';
+    const rtSelect = document.getElementById('edit-alert-recipient-type');
+    if (rtSelect) {
+        // Ensure 'all' option exists when editing a rule that was set to 'all'
+        // (it may have been stripped for non-admins, but they need to see the current value)
+        if (rt === 'all' && !rtSelect.querySelector('option[value="all"]')) {
+            const allOpt = document.createElement('option');
+            allOpt.value = 'all';
+            allOpt.textContent = 'Everyone (all team members)';
+            rtSelect.insertBefore(allOpt, rtSelect.options[1]);
+        }
+        rtSelect.value = rt;
+        onAlertRecipientTypeChange(rtSelect, 'edit-');
+    }
+    document.getElementById('edit-alert-email').value = rule.recipient_type === 'specific' ? rule.recipient_email : '';
+    const editDisplay = document.getElementById('edit-alert-email-display');
+    if (editDisplay) {
+        if (rt === 'self') editDisplay.value = window.currentUserEmail || rule.recipient_email;
+        else if (rt === 'all') editDisplay.value = 'All team members';
+        else editDisplay.value = rule.recipient_email;
+    }
     document.getElementById('edit-alert-active').checked = rule.is_active;
 
     const modal = document.getElementById('edit-alert-modal');
@@ -1995,10 +2317,15 @@ async function handleEditAlertSubmit(event) {
     const operator = document.getElementById('edit-alert-operator').value;
     const threshold = parseFloat(document.getElementById('edit-alert-threshold').value);
     const duration = parseInt(document.getElementById('edit-alert-duration').value);
-    const email = document.getElementById('edit-alert-email').value.trim();
+    const recipientType = document.getElementById('edit-alert-recipient-type').value;
+    let email = document.getElementById('edit-alert-email').value.trim();
+    if (recipientType === 'self') email = window.currentUserEmail || '';
+    if (recipientType === 'all') email = '';
     const isActive = document.getElementById('edit-alert-active').checked;
+    const targetType = document.getElementById('edit-alert-target-type').value;
+    const targetValue = document.getElementById('edit-alert-target-value').value.trim();
 
-    if (!id || !serverId || !metric || !email || isNaN(threshold) || isNaN(duration)) {
+    if (!id || !serverId || !metric || (recipientType === 'specific' && !email) || (metric !== 'process_down' && isNaN(threshold)) || isNaN(duration)) {
         showToast('Form Validation Error', 'All fields are required.', 'warning', 5000);
         return;
     }
@@ -2006,23 +2333,32 @@ async function handleEditAlertSubmit(event) {
     const rule = rulesCache[id] || {};
     const isFiring = rule.is_firing || false;
 
+    const payload = {
+        id: parseInt(id),
+        server_id: serverId,
+        metric_type: metric,
+        operator: operator,
+        threshold: isNaN(threshold) ? 0 : threshold,
+        duration_minutes: duration,
+        recipient_email: email,
+        recipient_type: recipientType,
+        is_active: isActive,
+        is_firing: isFiring,
+        target_type: targetType,
+        target_value: targetValue
+    };
+    if (metric === 'process_down') {
+        payload.operator = '==';
+        payload.threshold = 0;
+    }
+
     try {
         const resp = await fetchWithErrorHandling(
             `/api/alerts/rules?id=${id}`,
             {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    id: parseInt(id),
-                    server_id: serverId,
-                    metric_type: metric,
-                    operator: operator,
-                    threshold: threshold,
-                    duration_minutes: duration,
-                    recipient_email: email,
-                    is_active: isActive,
-                    is_firing: isFiring
-                })
+                body: JSON.stringify(payload)
             },
             'Failed to Update Alert Rule'
         );
@@ -2043,3 +2379,564 @@ async function handleEditAlertSubmit(event) {
         console.error("Error updating alert rule:", err);
     }
 }
+
+// COMMANDS TAB
+let cachedCommandSets = [];
+
+async function fetchServerCommands() {
+    if (!currentActiveServer) return;
+    const targetServerId = currentActiveServer;
+    try {
+        // Always fetch role fresh — ensures admin section is correct regardless of cache state
+        let userRole = 'viewer';
+        try {
+            const membersResp = await fetch(`/api/servers/members?id=${targetServerId}`);
+            if (currentActiveServer !== targetServerId) return;
+            if (membersResp.ok) {
+                const membersData = await membersResp.json();
+                if (currentActiveServer !== targetServerId) return;
+                userRole = membersData.current_user_role || 'viewer';
+                window.currentUserRole = userRole;
+            }
+        } catch (e) {
+            if (currentActiveServer !== targetServerId) return;
+            userRole = window.currentUserRole || 'viewer';
+        }
+
+        const resp = await fetch(`/api/servers/detail/${targetServerId}/commands`);
+        if (currentActiveServer !== targetServerId) return;
+        if (!resp.ok) {
+            // Still show the admin section so admin can add commands even if fetch failed
+            renderCommandSets(userRole);
+            return;
+        }
+        cachedCommandSets = await resp.json();
+        if (currentActiveServer !== targetServerId) return;
+        renderCommandSets(userRole);
+        renderCommandLogs();
+    } catch (err) {
+        console.error("Failed to fetch command sets:", err);
+    }
+}
+
+function renderCommandSets(userRole) {
+    // Accept userRole param; fall back to window.currentUserRole if not provided
+    const role = userRole || window.currentUserRole || 'viewer';
+    const container = document.getElementById('command-sets-container');
+    const adminSection = document.getElementById('commands-admin-section');
+    if (!container) return;
+
+    if (cachedCommandSets.length === 0) {
+        container.innerHTML = '<p style="font-size:13px; color:var(--text-secondary); padding:20px; text-align:center;">No command sets configured. ' +
+            (role === 'admin' ? 'Use the form above to add one.' : 'Ask an admin to configure commands.') + '</p>';
+    } else {
+        container.innerHTML = '';
+        cachedCommandSets.forEach(set => {
+            const card = document.createElement('div');
+            card.className = 'rule-item';
+            card.dataset.serviceName = set.service_name.toLowerCase();
+            card.style.flexDirection = 'column';
+            card.style.alignItems = 'stretch';
+            card.style.gap = '8px';
+
+            let actionsHtml = '';
+            Object.entries(set.commands).forEach(([type, cmd]) => {
+                const canExecute = role === 'admin' || role === 'operator';
+                actionsHtml += `<button class="btn-refresh" style="font-size:11px; padding:4px 10px; ${!canExecute ? 'opacity:0.5; cursor:not-allowed;' : ''}" 
+                    ${canExecute ? `onclick="executeCommand('${set.service_name}', '${type}')"` : 'disabled'}
+                    title="${cmd.replace(/"/g, '&quot;')}"><i class="fa-solid fa-play"></i> ${type}</button>`;
+            });
+
+            const isAdmin = role === 'admin';
+            card.innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <strong style="color:var(--text-primary); font-size:14px;"><i class="fa-solid fa-cube"></i> ${set.service_name}</strong>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        ${isAdmin ? `<button class="btn-refresh" onclick="editCommandSet('${set.service_name}')" style="font-size:11px; padding:4px 8px;" title="Edit"><i class="fa-solid fa-edit"></i></button>
+                        <button class="btn-refresh" onclick="deleteCommandSet('${set.service_name}')" style="font-size:11px; padding:4px 8px; color:var(--danger);" title="Delete"><i class="fa-solid fa-trash"></i></button>` : ''}
+                    </div>
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                    ${actionsHtml}
+                </div>
+            `;
+            container.appendChild(card);
+        });
+    }
+
+    // Show/hide admin JSON editor section based on role
+    if (adminSection) {
+        adminSection.style.display = role === 'admin' ? 'block' : 'none';
+    }
+}
+
+function filterCommandSets() {
+    const search = document.getElementById('cmd-search').value.toLowerCase();
+    document.querySelectorAll('#command-sets-container .rule-item').forEach(card => {
+        const name = card.dataset.serviceName || '';
+        card.style.display = name.includes(search) ? '' : 'none';
+    });
+}
+
+async function fetchCommandLogs() {
+    if (!currentActiveServer) return;
+    const targetServerId = currentActiveServer;
+    try {
+        const resp = await fetch(`/api/servers/detail/${targetServerId}/commands/logs`);
+        if (currentActiveServer !== targetServerId) return;
+        if (!resp.ok) return;
+        const logs = await resp.json();
+        if (currentActiveServer !== targetServerId) return;
+        renderCommandLogsTable(logs);
+    } catch (err) {
+        console.error("Failed to fetch command logs:", err);
+    }
+}
+
+
+function renderCommandLogs() {
+    fetchCommandLogs();
+}
+
+let cachedLogs = [];
+
+function renderCommandLogsTable(logs) {
+    cachedLogs = logs;
+    const body = document.getElementById('cmd-log-body');
+    if (!body) return;
+    if (logs.length === 0) {
+        body.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:15px; opacity:0.5;">No commands have been executed yet.</td></tr>';
+        return;
+    }
+    body.innerHTML = '';
+    logs.forEach(l => {
+        const row = document.createElement('tr');
+        const time = new Date(l.executed_at).toLocaleString();
+        const isSuccess = l.status === 'success';
+        const cmdEscaped = (l.command || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const durationSec = ((l.duration_ms || 0) / 1000).toFixed(2) + 's';
+        row.innerHTML = `
+            <td>${l.service_name}</td>
+            <td><code style="font-size:11px;">${l.command_type}</code></td>
+            <td style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${cmdEscaped}"><code style="font-size:11px;">${cmdEscaped}</code></td>
+            <td>${l.executed_by}</td>
+            <td>${time}</td>
+            <td>${durationSec}</td>
+            <td><span class="badge ${isSuccess ? 'badge-success' : 'badge-danger'}">${l.status}</span></td>
+            <td><button class="btn-refresh" style="font-size:10px; padding:2px 6px;" onclick="showCommandOutput(${l.id})"><i class="fa-solid fa-eye"></i></button></td>
+        `;
+        body.appendChild(row);
+    });
+}
+
+function showCommandOutput(id) {
+    const log = cachedLogs.find(l => l.id === id);
+    if (!log) return;
+    const durationSec = ((log.duration_ms || 0) / 1000).toFixed(2);
+    const output = log.output || '(no output)';
+    const maxLen = 500;
+    const display = output.length > maxLen ? output.substring(0, maxLen) + '...' : output;
+    const escaped = (display).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    showToast(`Command Output #${id} (ran for ${durationSec}s)`, `<pre style="max-height:300px; overflow:auto; font-size:11px; text-align:left; background:#000; padding:10px; border-radius:4px; white-space:pre-wrap; color:#0f0;">${escaped}</pre>`, 'info', 8000, true);
+}
+
+function editCommandSet(serviceName) {
+    const set = cachedCommandSets.find(s => s.service_name === serviceName);
+    if (!set) return;
+    document.getElementById('cmd-service-name').value = set.service_name;
+    document.getElementById('cmd-commands-json').value = JSON.stringify(set.commands, null, 4);
+    document.getElementById('commands-admin-section').scrollIntoView({ behavior: 'smooth' });
+}
+
+function resetCommandForm() {
+    document.getElementById('cmd-service-name').value = '';
+    document.getElementById('cmd-commands-json').value = '';
+}
+
+async function deleteCommandSet(serviceName) {
+    if (!confirm(`Delete command set "${serviceName}"?`)) return;
+    try {
+        const resp = await fetch(`/api/servers/detail/${currentActiveServer}/commands?name=${encodeURIComponent(serviceName)}`, { method: 'DELETE' });
+        if (resp.ok) {
+            showToast('Deleted', `Command set "${serviceName}" deleted.`, 'info', 3000);
+            fetchServerCommands();
+        }
+    } catch (err) {
+        console.error("Failed to delete command set:", err);
+    }
+}
+
+async function executeCommand(serviceName, commandType) {
+    if (!confirm(`Execute "${commandType}" on "${serviceName}"?`)) return;
+    try {
+        const resp = await fetch(`/api/servers/detail/${currentActiveServer}/commands/execute`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service_name: serviceName, command_type: commandType })
+        });
+        if (resp.ok) {
+            const result = await resp.json().catch(() => ({ status: 'success', output: 'Success', duration_ms: 0 }));
+            const durationSec = ((result.duration_ms || 0) / 1000).toFixed(2);
+            const durationText = `ran for ${durationSec}s`;
+            const displayOutput = (result.output || 'No output').substring(0, 500);
+            const escapedOutput = escapeHtml(displayOutput);
+            const msgHtml = `<strong>Status:</strong> ${result.status} (${durationText})<br><pre style="font-size:11px; text-align:left; background:#000; padding:8px; border-radius:4px; max-height:200px; overflow:auto; margin-top:5px; white-space:pre-wrap; color:#0f0;">${escapedOutput}</pre>`;
+            showToast('Command Executed', msgHtml, result.status === 'success' ? 'success' : 'error', 8000, true);
+        } else {
+            let errMsg = 'Execution Failed';
+            try {
+                const result = await resp.json();
+                errMsg = result.output || result.error || errMsg;
+            } catch (_) {
+                errMsg = await resp.text().catch(() => 'Execution Failed');
+            }
+            showToast('Execution Failed', errMsg, 'error', 5000);
+        }
+        fetchServerCommands();
+    } catch (err) {
+        showToast('Execution Error', err.message, 'error', 5000);
+    }
+}
+
+// Initialize command set form handler
+document.addEventListener('DOMContentLoaded', () => {
+    const form = document.getElementById('command-set-form');
+    if (form) {
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (!currentActiveServer) return;
+            const serviceName = document.getElementById('cmd-service-name').value.trim();
+            let commands;
+            try {
+                commands = JSON.parse(document.getElementById('cmd-commands-json').value.trim());
+            } catch (_) {
+                showToast('Validation Error', 'Invalid JSON in commands field.', 'warning', 4000);
+                return;
+            }
+            if (!serviceName || !commands || typeof commands !== 'object') {
+                showToast('Validation Error', 'Service name and valid commands JSON are required.', 'warning', 4000);
+                return;
+            }
+            try {
+                const resp = await fetch(`/api/servers/detail/${currentActiveServer}/commands`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ service_name: serviceName, commands })
+                });
+                if (resp.ok) {
+                    showToast('Saved', `Command set "${serviceName}" saved.`, 'success', 3000);
+                    resetCommandForm();
+                    fetchServerCommands();
+                } else {
+                    let errMsg = 'Failed to save';
+                    try {
+                        const err = await resp.json();
+                        errMsg = err.error || err.message || errMsg;
+                    } catch (_) {
+                        errMsg = await resp.text().catch(() => 'Failed to save');
+                    }
+                    showToast('Error', errMsg, 'error', 4000);
+                }
+            } catch (err) {
+                showToast('Error', err.message, 'error', 4000);
+            }
+        });
+    }
+});
+
+// SERVER TEAM ACCESS MANAGEMENT
+let currentTeamServerId = null;
+
+function openTeamModal(serverId, hostname) {
+    currentTeamServerId = serverId;
+    
+    const serverIdEl = document.getElementById('team-server-id');
+    const userEl = document.getElementById('team-invite-username');
+    const roleEl = document.getElementById('team-invite-role');
+    
+    if (serverIdEl) serverIdEl.value = serverId;
+    if (userEl) userEl.value = '';
+    if (roleEl) roleEl.value = 'viewer';
+    
+    const modalTitle = document.querySelector('#team-modal .modal-header h3');
+    if (modalTitle) {
+        modalTitle.innerHTML = `<i class="fa-solid fa-users-gear"></i> Access &amp; Team Settings - ${hostname}`;
+    }
+
+    const modal = document.getElementById('team-modal');
+    if (modal) {
+        modal.style.display = 'flex';
+        modal.classList.add('open');
+    }
+    
+    loadServerMembers(serverId);
+}
+
+function closeTeamModal() {
+    currentTeamServerId = null;
+    const modal = document.getElementById('team-modal');
+    if (modal) {
+        modal.style.display = 'none';
+        modal.classList.remove('open');
+    }
+}
+
+async function loadServerMembers(serverId) {
+    try {
+        const resp = await fetch(`/api/servers/members?id=${serverId}`);
+        if (!resp.ok) {
+            console.error("Failed to load server members");
+            return;
+        }
+        const data = await resp.json();
+        const members = data.members || [];
+        const currentUserRole = data.current_user_role || 'viewer';
+
+        const inviteSection = document.getElementById('team-invite-section');
+        if (inviteSection) {
+            inviteSection.style.display = currentUserRole === 'admin' ? 'block' : 'none';
+        }
+
+        const listContainer = document.getElementById('team-members-list');
+        if (!listContainer) return;
+        listContainer.innerHTML = '';
+
+        if (members.length === 0) {
+            listContainer.innerHTML = `<p style="text-align: center; color: var(--text-faint); margin: 20px 0; font-size: 13px;">No members added yet.</p>`;
+            return;
+        }
+
+        // Deduplicate case-insensitively (guards against DB having both 'DevAyyan' and 'devayyan')
+        // Keep the admin/highest-role entry when there are duplicates
+        const seen = new Set();
+        const uniqueMembers = members.filter(m => {
+            const key = m.username.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+
+        uniqueMembers.forEach(m => {
+            const isSelf = m.username.toLowerCase() === (window.currentUserUsername || '').toLowerCase();
+
+            const div = document.createElement('div');
+            div.style.display = 'flex';
+            div.style.alignItems = 'center';
+            div.style.justifyContent = 'space-between';
+            div.style.background = 'rgba(255, 255, 255, 0.02)';
+            div.style.border = '1px solid var(--border-color)';
+            div.style.padding = '8px 12px';
+            div.style.borderRadius = '8px';
+            div.style.gap = '10px';
+
+            const avatarUrl = `https://github.com/${m.username}.png?size=40`;
+
+            let roleControlHtml = '';
+            if (currentUserRole === 'admin' && !isSelf) {
+                // Admin can change other members' roles, but not their own (prevents self-demotion)
+                roleControlHtml = `
+                    <select onchange="updateMemberRole('${serverId}', '${m.username}', this.value)" style="background: var(--bg-card); border: 1px solid var(--border-color); color: var(--text-primary); font-size: 12px; padding: 4px 8px; border-radius: 4px; font-weight: 600;">
+                        <option value="viewer" ${m.role === 'viewer' ? 'selected' : ''}>Viewer</option>
+                        <option value="operator" ${m.role === 'operator' || m.role === 'member' ? 'selected' : ''}>Operator</option>
+                        <option value="admin" ${m.role === 'admin' ? 'selected' : ''}>Admin</option>
+                    </select>
+                `;
+            } else {
+                // Show role as a badge — can't change own role
+                const roleLabel = m.role === 'member' ? 'operator' : m.role;
+                roleControlHtml = `<span style="font-size: 11px; font-weight: 700; color: var(--text-secondary); background: rgba(255,255,255,0.06); padding: 3px 6px; border-radius: 4px; text-transform: uppercase; border: 1px solid var(--border-color);">${roleLabel}</span>`;
+            }
+
+            // Only admins can remove OTHER members. Never show a remove/leave button for yourself.
+            let removeButtonHtml = '';
+            if (currentUserRole === 'admin' && !isSelf) {
+                removeButtonHtml = `
+                    <button onclick="removeServerMember('${serverId}', '${m.username}', false)" style="background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); color: #f87171; cursor: pointer; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; transition: all 0.2s;" onmouseover="this.style.background='rgba(239, 68, 68, 0.15)'" onmouseout="this.style.background='rgba(239, 68, 68, 0.08)'">
+                        Remove
+                    </button>
+                `;
+            }
+
+            div.innerHTML = `
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+                    <img src="${avatarUrl}" onerror="this.src='https://github.com/identicons/${m.username}.png'" style="width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--border-color); flex-shrink: 0;">
+                    <div style="display: flex; flex-direction: column; min-width: 0;">
+                        <span style="font-size: 13px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${m.username} ${isSelf ? '<span style="color: var(--primary); font-size: 11px;">(you)</span>' : ''}</span>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                    ${roleControlHtml}
+                    ${removeButtonHtml}
+                </div>
+            `;
+            listContainer.appendChild(div);
+        });
+
+    } catch (e) {
+        console.error("Error loading members:", e);
+    }
+}
+
+async function handleTeamInvite(e) {
+    e.preventDefault();
+    const serverId = document.getElementById('team-server-id').value;
+    const username = document.getElementById('team-invite-username').value.trim();
+    const role = document.getElementById('team-invite-role').value;
+
+    if (!serverId || !username) return;
+
+    try {
+        const resp = await fetch('/api/servers/members/invite', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ server_id: serverId, username, role })
+        });
+        const res = await resp.json();
+        if (resp.ok) {
+            document.getElementById('team-invite-username').value = '';
+            loadServerMembers(serverId);
+        } else {
+            alert(res.message || "Failed to invite member.");
+        }
+    } catch (e) {
+        console.error("Error inviting member:", e);
+    }
+}
+
+async function updateMemberRole(serverId, username, newRole) {
+    try {
+        const resp = await fetch('/api/servers/members/role', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ server_id: serverId, username, role: newRole })
+        });
+        const res = await resp.json();
+        if (!resp.ok) {
+            alert(res.message || "Failed to update role.");
+            loadServerMembers(serverId);
+        } else {
+            loadServerMembers(serverId);
+        }
+    } catch (e) {
+        console.error("Error updating role:", e);
+    }
+}
+
+async function removeServerMember(serverId, username, isSelf) {
+    const actionText = isSelf ? "leave this server" : `remove ${username} from this server`;
+    if (!confirm(`Are you sure you want to ${actionText}?`)) return;
+
+    try {
+        const resp = await fetch(`/api/servers/members/remove?server_id=${serverId}&username=${username}`, {
+            method: 'DELETE'
+        });
+        const res = await resp.json();
+        if (resp.ok) {
+            if (isSelf) {
+                closeTeamModal();
+                if (typeof fetchDashboardData === 'function') fetchDashboardData();
+            } else {
+                loadServerMembers(serverId);
+            }
+        } else {
+            alert(res.message || "Failed to remove member.");
+        }
+    } catch (e) {
+        console.error("Error removing member:", e);
+    }
+}
+
+// Scoped Alerts and Team helper functions
+function openTeamModalFromDetail() {
+    const sid = currentActiveServer;
+    let hostname = serversMap[sid] ? serversMap[sid].hostname : '';
+    if (!hostname) {
+        const titleEl = document.getElementById('modal-server-title');
+        if (titleEl) {
+            const text = titleEl.textContent || '';
+            hostname = text.split('(')[0].replace(/[<>\/]/g, '').trim();
+        }
+    }
+    if (sid && hostname) {
+        openTeamModal(sid, hostname);
+    }
+}
+
+function onAlertTargetTypeChange(typeSelect, prefix = 'create-') {
+    const type = typeSelect.value;
+    const valueGroup = document.getElementById(prefix + 'alert-target-value-group');
+    const metricSelect = document.getElementById(prefix + 'alert-metric');
+    
+    if (valueGroup) {
+        valueGroup.style.display = type === 'server' ? 'none' : 'block';
+    }
+    
+    if (metricSelect) {
+        metricSelect.innerHTML = '';
+        if (type === 'server') {
+            metricSelect.innerHTML = `
+                <option value="cpu">CPU Usage (%)</option>
+                <option value="ram">RAM Usage (%)</option>
+                <option value="disk">Disk Usage (%)</option>
+                <option value="custom">Custom Metric Key...</option>
+            `;
+        } else {
+            metricSelect.innerHTML = `
+                <option value="process_down">Is Not Running (Offline)</option>
+                <option value="cpu">CPU Usage (%)</option>
+                <option value="ram">Memory Usage (MB)</option>
+            `;
+        }
+    }
+    
+    onAlertMetricChange(metricSelect, prefix);
+}
+
+function getRuleDescription(rule) {
+    const scope = rule.target_type || 'server';
+    const target = rule.target_value || '';
+    const metric = rule.metric_type;
+    
+    if (scope === 'process' || scope === 'application') {
+        const typeLabel = scope === 'process' ? 'Process' : 'App';
+        if (metric === 'process_down') {
+            return `<strong>${typeLabel} Offline:</strong> ${target}`;
+        }
+        const unit = metric === 'ram' ? 'MB' : '%';
+        const metricName = metric.toUpperCase();
+        return `<strong>${typeLabel} ${target}:</strong> ${metricName} ${rule.operator} ${rule.threshold}${unit}`;
+    }
+    
+    // Server scope
+    const isCustom = !['cpu', 'ram', 'disk'].includes(metric);
+    const metricLabel = isCustom ? metric : metric.toUpperCase();
+    return `<strong>Server ${metricLabel}</strong> ${rule.operator} ${rule.threshold}%`;
+}
+
+function navigateToAddAlert(type, value) {
+    switchTab('alerts-tab');
+    
+    const typeSelect = document.getElementById('alert-target-type');
+    if (typeSelect) {
+        typeSelect.value = type;
+        onAlertTargetTypeChange(typeSelect, 'create-');
+    }
+    
+    const valInput = document.getElementById('alert-target-value');
+    if (valInput) {
+        valInput.value = value;
+    }
+}
+
+// Bind to window
+window.openTeamModal = openTeamModal;
+window.closeTeamModal = closeTeamModal;
+window.handleTeamInvite = handleTeamInvite;
+window.updateMemberRole = updateMemberRole;
+window.removeServerMember = removeServerMember;
+window.openTeamModalFromDetail = openTeamModalFromDetail;
+window.onAlertTargetTypeChange = onAlertTargetTypeChange;
+window.getRuleDescription = getRuleDescription;
+window.navigateToAddAlert = navigateToAddAlert;
+window.filterApplications = filterApplications;
+

@@ -139,4 +139,23 @@ func getCachedMetrics(serverID string) (map[string]interface{}, bool) {
 
 func setCachedMetrics(serverID string, metrics map[string]interface{}, seconds int) {
 	setCachedJSON("metrics:"+serverID, metrics, seconds)
+	publishMetricStream(serverID, metrics)
 }
+
+func publishMetricStream(serverID string, metrics map[string]interface{}) {
+	if globalRedis == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"server_id": serverID,
+		"metrics":   metrics,
+		"timestamp": time.Now().Unix(),
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	_ = globalRedis.Publish("metrics_stream_global", string(b))
+	_ = globalRedis.Publish("metrics_stream:"+serverID, string(b))
+}
+

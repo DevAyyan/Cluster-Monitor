@@ -1,19 +1,25 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 // cluster-target: a tiny, silent monitoring agent for the Fleet Monitor system.
@@ -29,18 +35,13 @@ const (
 
 var (
 	serverID      string
+	agentToken    string
 	endpoints     []string
 	endpointMu    sync.Mutex
 	endpointsFile = defaultEndpointsFile()
 
 	lastCPUTicks   = make(map[string]CPUTicks)
 	lastCPUTicksMu sync.Mutex
-
-	staticMu        sync.Mutex
-	staticMemTotal  float64 // in kB
-	staticSwapTotal float64 // in kB
-	staticDiskTotal float64 // in bytes
-	staticNumCores  int
 )
 
 // defaultEndpointsFile returns a user-writable path for the endpoints config.
@@ -56,34 +57,35 @@ type CPUTicks struct {
 }
 
 func main() {
-	// --- Stable SERVER_ID: persist across restarts ---
+	// --- Credentials: read from env (set by the systemd unit or the initial SSH run) ---
 	serverID = os.Getenv("SERVER_ID")
 	if serverID == "" {
 		serverID = loadOrCreateServerID()
 	}
-	if envFile := os.Getenv("ENDPOINTS_FILE"); envFile != "" {
-		endpointsFile = envFile
+	agentToken = os.Getenv("AGENT_TOKEN")
+
+	// HOST_ENDPOINT can be supplied directly as an env var (e.g. on first run via SSH)
+	// or loaded from the endpoints file written on previous runs.
+	if ep := strings.TrimSpace(os.Getenv("HOST_ENDPOINT")); ep != "" {
+		endpoints = []string{ep}
+	} else {
+		if envFile := os.Getenv("ENDPOINTS_FILE"); envFile != "" {
+			endpointsFile = envFile
+		}
+		loadEndpoints()
 	}
-	loadEndpoints()
 
 	// --- Self-install systemd service on first run (if not already running as one) ---
 	go selfInstallService()
 
-	http.HandleFunc(apiVersion+"/metrics", authOptional(handleMetrics))
-	http.HandleFunc(apiVersion+"/processes", authOptional(handleProcesses))
-	http.HandleFunc(apiVersion+"/systemlogs", authOptional(handleSystemLogs))
-	http.HandleFunc(apiVersion+"/networks", authOptional(handleNetworks))
-	http.HandleFunc(apiVersion+"/storage", authOptional(handleStorage))
-	http.HandleFunc(apiVersion+"/containers", authOptional(handleContainers))
-	http.HandleFunc(apiVersion+"/container-action", authOptional(handleContainerAction))
-	http.HandleFunc(apiVersion+"/logs", authOptional(handleLogs)) // GET / POST API failure logs
-	http.HandleFunc(apiVersion+"/endpoint", handleEndpoint) // add/remove Host endpoints
-	http.HandleFunc(apiVersion+"/uninstall", handleUninstall) // self-destruction teardown
-
-	log.Printf("[cluster-target] listening on %s (serverID=%s, endpoints=%d)", listenAddr, serverID, len(endpoints))
-	go pushLoop()
+	log.Printf("[cluster-target] starting client agent (serverID=%s, endpoints=%d)", serverID, len(endpoints))
 	go logMonitorLoop()
-	log.Fatal(http.ListenAndServe(listenAddr, nil))
+
+	for _, ep := range endpoints {
+		go startAgentWSLoop(ep)
+	}
+
+	select {}
 }
 
 func handleUninstall(w http.ResponseWriter, r *http.Request) {
@@ -123,8 +125,12 @@ func loadOrCreateServerID() string {
 
 // configDir returns the writable config directory for this agent.
 func configDir() string {
-	if err := os.MkdirAll("/etc/cluster-target", 0755); err == nil {
-		return "/etc/cluster-target"
+	// Only use system-wide /etc/cluster-target if running as root (UID "0" or user "root")
+	currentUser, err := user.Current()
+	if err == nil && (currentUser.Uid == "0" || currentUser.Username == "root") {
+		if err := os.MkdirAll("/etc/cluster-target", 0755); err == nil {
+			return "/etc/cluster-target"
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -133,10 +139,10 @@ func configDir() string {
 	return filepath.Join(home, ".config", "cluster-target")
 }
 
-// ---- Self-install systemd service ----
-
-// selfInstallService installs and enables the systemd service for this agent automatically
-// on the first run so it survives reboots without any manual steps.
+// selfInstallService installs and enables the systemd service for this agent
+// automatically on the first run so it survives reboots without any manual steps.
+// All credentials are embedded directly into the service unit's Environment= lines
+// so NO external config files are required — the binary is the only installed artifact.
 func selfInstallService() {
 	// Already running as a systemd service — nothing to do.
 	if os.Getenv("INVOCATION_ID") != "" {
@@ -147,7 +153,19 @@ func selfInstallService() {
 		return
 	}
 	exe, _ = filepath.EvalSymlinks(exe)
-	cfgDir := configDir()
+
+	// Embed all three credentials in the unit so the service needs zero external files.
+	hostEndpointLine := ""
+	if ep := strings.TrimSpace(os.Getenv("HOST_ENDPOINT")); ep != "" {
+		hostEndpointLine = fmt.Sprintf("Environment=HOST_ENDPOINT=%s", ep)
+	} else if len(endpoints) > 0 {
+		hostEndpointLine = fmt.Sprintf("Environment=HOST_ENDPOINT=%s", endpoints[0])
+	}
+
+	agentTokenLine := ""
+	if agentToken != "" {
+		agentTokenLine = fmt.Sprintf("Environment=AGENT_TOKEN=%s", agentToken)
+	}
 
 	serviceContent := fmt.Sprintf(`[Unit]
 Description=Fleet Monitor Target Agent (cluster-target)
@@ -156,13 +174,15 @@ After=network.target
 [Service]
 Type=simple
 Environment=SERVER_ID=%s
+%s
+%s
 ExecStart=%s
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=default.target
-`, serverID, exe)
+`, serverID, agentTokenLine, hostEndpointLine, exe)
 
 	// Try system-wide install (root) first
 	systemUnit := "/etc/systemd/system/cluster-target.service"
@@ -185,7 +205,6 @@ WantedBy=default.target
 		return
 	}
 	userUnit := filepath.Join(unitDir, "cluster-target.service")
-	// Replace ProtectHome in user unit (not supported for user services)
 	if err := os.WriteFile(userUnit, []byte(serviceContent), 0644); err != nil {
 		log.Printf("[cluster-target] warning: could not write user service: %v", err)
 		return
@@ -193,9 +212,6 @@ WantedBy=default.target
 	exec.Command("systemctl", "--user", "daemon-reload").Run()
 	exec.Command("systemctl", "--user", "enable", "--now", "cluster-target").Run()
 	log.Printf("[cluster-target] auto-installed user service at %s (id=%s)", userUnit, serverID)
-
-	// Also write endpoint to config dir so it survives restart
-	_ = os.MkdirAll(cfgDir, 0755)
 }
 
 // ---- Endpoint management ----
@@ -316,6 +332,10 @@ func contains(s []string, v string) bool {
 
 // ---- Push loop (Host-registered endpoints) ----
 
+var agentPushClient = &http.Client{
+	Timeout: 3 * time.Second,
+}
+
 func pushLoop() {
 	ticker := time.NewTicker(pushInterval)
 	for range ticker.C {
@@ -332,7 +352,7 @@ func pushLoop() {
 					return
 				}
 				req.Header.Set("Content-Type", "application/json")
-				resp, err := http.DefaultClient.Do(req)
+				resp, err := agentPushClient.Do(req)
 				if err != nil {
 					log.Printf("[cluster-target] push to %s failed: %v", u, err)
 					return
@@ -501,7 +521,7 @@ func pushFailureLogToHost(entry FailureLog) {
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := agentPushClient.Do(req)
 		if err == nil {
 			resp.Body.Close()
 		}
@@ -621,6 +641,38 @@ func handleStorage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(parseDFOutput(string(out)))
 }
+func handleDockerInfo(w http.ResponseWriter, r *http.Request) {
+	verOut, _ := exec.Command("docker", "version", "--format", "{{json .}}").Output()
+	var ver interface{}
+	_ = json.Unmarshal(verOut, &ver)
+
+	imgOut, _ := exec.Command("docker", "images", "--format", "{{json .}}").Output()
+	images := []map[string]interface{}{}
+	for _, line := range strings.Split(strings.TrimSpace(string(imgOut)), "\n") {
+		var img map[string]interface{}
+		if json.Unmarshal([]byte(line), &img) == nil {
+			images = append(images, img)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"available": true,
+		"version":   ver,
+		"images":    images,
+	})
+}
+
+func handleNetworkConnections(w http.ResponseWriter, r *http.Request) {
+	out, err := exec.Command("bash", "-c", "echo '---TCP---'; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; echo '---UDP---'; cat /proc/net/udp /proc/net/udp6 2>/dev/null").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write(out)
+}
+
 
 func parseDFOutput(out string) []map[string]interface{} {
 	lines := strings.Split(strings.TrimSpace(out), "\n")
@@ -840,44 +892,12 @@ func parseMetrics(out string) map[string]interface{} {
 		}
 	}
 
-	staticMu.Lock()
-	if staticMemTotal == 0 && memInfo["MEMTOTAL:"] > 0 {
-		staticMemTotal = memInfo["MEMTOTAL:"]
+	memTotal := memInfo["MEMTOTAL:"]
+	swapTotal := memInfo["SWAPTOTAL:"]
+	var diskTotal float64
+	if t, ok := res["disk_total_gb"].(float64); ok && t > 0 {
+		diskTotal = t * 1024 * 1024 * 1024
 	}
-	if staticSwapTotal == 0 && memInfo["SWAPTOTAL:"] > 0 {
-		staticSwapTotal = memInfo["SWAPTOTAL:"]
-	}
-	if staticDiskTotal == 0 {
-		if t, ok := res["disk_total_gb"].(float64); ok && t > 0 {
-			staticDiskTotal = t * 1024 * 1024 * 1024
-		}
-	}
-	if staticNumCores == 0 && len(cpuLines) > 0 {
-		count := 0
-		for {
-			coreName := fmt.Sprintf("cpu%d", count)
-			found := false
-			for _, cl := range cpuLines {
-				if strings.HasPrefix(cl, coreName+" ") {
-					found = true
-					break
-				}
-			}
-			if !found {
-				break
-			}
-			count++
-		}
-		if count > 0 {
-			staticNumCores = count
-		}
-	}
-
-	memTotal := staticMemTotal
-	swapTotal := staticSwapTotal
-	diskTotal := staticDiskTotal
-	numCores := staticNumCores
-	staticMu.Unlock()
 
 	// RAM
 	memAvail := memInfo["MEMAVAILABLE:"]
@@ -915,6 +935,21 @@ func parseMetrics(out string) map[string]interface{} {
 
 	// CPU
 	if len(cpuLines) > 0 {
+		numCores := 0
+		for {
+			coreName := fmt.Sprintf("cpu%d", numCores)
+			found := false
+			for _, cl := range cpuLines {
+				if strings.HasPrefix(cl, coreName+" ") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				break
+			}
+			numCores++
+		}
 		coreValues := make(map[string]float64)
 		lastCPUTicksMu.Lock()
 		for _, cl := range cpuLines {
@@ -1257,3 +1292,254 @@ func getNetRates() (float64, float64) {
 
 	return currRxRate, currTxRate
 }
+
+// ---- WebSocket Communication Logic ----
+
+type WSMessage struct {
+	Type      string          `json:"type"`       // "metrics", "command_request", "command_response", "heartbeat"
+	RequestID string          `json:"request_id"`
+	ServerID  string          `json:"server_id"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+type WSRequestPayload struct {
+	Method string `json:"method"`
+	Path   string `json:"path"`
+	Body   []byte `json:"body"`
+}
+
+type WSResponsePayload struct {
+	StatusCode int    `json:"status_code"`
+	Body       []byte `json:"body"`
+}
+
+type mockResponseWriter struct {
+	header     http.Header
+	body       bytes.Buffer
+	statusCode int
+}
+
+func newMockResponseWriter() *mockResponseWriter {
+	return &mockResponseWriter{
+		header:     make(http.Header),
+		statusCode: http.StatusOK,
+	}
+}
+
+func (w *mockResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *mockResponseWriter) Write(b []byte) (int, error) {
+	return w.body.Write(b)
+}
+
+func (w *mockResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+}
+
+func startAgentWSLoop(ep string) {
+	wsURL := ep
+	if strings.HasPrefix(wsURL, "http://") {
+		wsURL = "ws://" + strings.TrimPrefix(wsURL, "http://")
+	} else if strings.HasPrefix(wsURL, "https://") {
+		wsURL = "wss://" + strings.TrimPrefix(wsURL, "https://")
+	}
+	wsURL = strings.TrimRight(wsURL, "/") + "/api/ws?server_id=" + url.QueryEscape(serverID) + "&token=" + url.QueryEscape(agentToken)
+
+	backoff := 1 * time.Second
+	for {
+		log.Printf("[ws-client] Connecting to Host WebSocket: %s", ep)
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			log.Printf("[ws-client] Connection failed: %v. Retrying in %v...", err, backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			continue
+		}
+		backoff = 1 * time.Second
+		log.Printf("[ws-client] Successfully connected to Host: %s", ep)
+
+		stopPush := make(chan struct{})
+		go runMetricsPushLoop(conn, stopPush)
+
+		err = runCommandReadLoop(conn)
+		close(stopPush)
+		conn.Close()
+		log.Printf("[ws-client] Connection closed: %v. Reconnecting in 2s...", err)
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func runMetricsPushLoop(conn *websocket.Conn, stop chan struct{}) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m := collectMetrics()
+			rawPayload, err := json.Marshal(m)
+			if err != nil {
+				continue
+			}
+			msg := WSMessage{
+				Type:      "metrics",
+				ServerID:  serverID,
+				Payload:   rawPayload,
+			}
+			rawMsg, _ := json.Marshal(msg)
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.WriteMessage(websocket.TextMessage, rawMsg); err != nil {
+				return
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
+func runCommandReadLoop(conn *websocket.Conn) error {
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+
+		var msg WSMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+
+		if msg.Type == "command_request" {
+			go processHostCommand(conn, msg)
+		}
+	}
+}
+
+func processHostCommand(conn *websocket.Conn, msg WSMessage) {
+	var req WSRequestPayload
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return
+	}
+
+	var handler http.HandlerFunc
+	switch req.Path {
+	case "processes":
+		handler = handleProcesses
+	case "containers":
+		handler = handleContainers
+	case "systemlogs":
+		handler = handleSystemLogs
+	case "storage":
+		handler = handleStorage
+	case "networks":
+		handler = handleNetworks
+	case "metrics":
+		handler = handleMetrics
+	case "uninstall":
+		handler = handleUninstall
+	case "container-action":
+		handler = handleContainerAction
+	case "endpoint":
+		handler = handleEndpoint
+	case "docker-info":
+		handler = handleDockerInfo
+	case "network-connections":
+		handler = handleNetworkConnections
+	case "exec-command":
+		handler = handleExecCommand
+	default:
+		respondWithStatus(conn, msg.RequestID, http.StatusNotFound, []byte("Endpoint not found"))
+		return
+	}
+
+	httpReq, err := http.NewRequest(req.Method, "/api/v1/"+req.Path, bytes.NewReader(req.Body))
+	if err != nil {
+		respondWithStatus(conn, msg.RequestID, http.StatusInternalServerError, []byte(err.Error()))
+		return
+	}
+	if req.Method == "POST" {
+		httpReq.Header.Set("Content-Type", "application/json")
+	}
+
+	w := newMockResponseWriter()
+	handler(w, httpReq)
+
+	resPayload := WSResponsePayload{
+		StatusCode: w.statusCode,
+		Body:       w.body.Bytes(),
+	}
+	rawPayload, _ := json.Marshal(resPayload)
+
+	resMsg := WSMessage{
+		Type:      "command_response",
+		RequestID: msg.RequestID,
+		ServerID:  serverID,
+		Payload:   rawPayload,
+	}
+	rawMsg, _ := json.Marshal(resMsg)
+
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.WriteMessage(websocket.TextMessage, rawMsg)
+}
+
+func respondWithStatus(conn *websocket.Conn, reqID string, status int, body []byte) {
+	resPayload := WSResponsePayload{
+		StatusCode: status,
+		Body:       body,
+	}
+	rawPayload, _ := json.Marshal(resPayload)
+	resMsg := WSMessage{
+		Type:      "command_response",
+		RequestID: reqID,
+		ServerID:  serverID,
+		Payload:   rawPayload,
+	}
+	rawMsg, _ := json.Marshal(resMsg)
+	_ = conn.WriteMessage(websocket.TextMessage, rawMsg)
+}
+
+func handleExecCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Command string `json:"command"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	// Limit command execution to 7 seconds so it doesn't block the WebSocket connection indefinitely
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "powershell.exe", "-Command", req.Command)
+	} else {
+		cmd = exec.CommandContext(ctx, "bash", "-c", req.Command)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":     false,
+			"output": string(out) + "\nCommand execution timed out (exceeded 7 second limit)",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":     err == nil,
+		"output": string(out),
+	})
+}
+

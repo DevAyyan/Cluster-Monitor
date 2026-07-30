@@ -357,6 +357,9 @@
                     <h2 id="modal-server-title"><i class="fa-solid fa-server"></i> server-name</h2>
                 </div>
                 <div style="display: flex; gap: 15px; align-items: center;">
+                    <button class="btn-primary" id="detail-server-team-btn" onclick="openTeamModalFromDetail()"
+                        style="background-color: var(--primary, #38bdf8); border: none; color: white; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background-color 0.2s;"><i
+                            class="fa-solid fa-users"></i> Team</button>
                     <button class="btn-danger" id="unregister-server-btn" onclick="unregisterCurrentServer()"
                         style="background-color: var(--danger, #ef4444); border: none; color: white; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background-color 0.2s;"><i
                             class="fa-solid fa-trash"></i> Unregister</button>
@@ -386,6 +389,8 @@
                             class="fa-solid fa-network-wired"></i> Networks</button>
                     <button class="tab-btn" data-tab="alerts-tab" onclick="switchTab('alerts-tab', this)"><i
                             class="fa-solid fa-bell"></i> Alerts</button>
+                    <button class="tab-btn" data-tab="commands-tab" onclick="switchTab('commands-tab', this)"><i
+                            class="fa-solid fa-terminal"></i> Commands</button>
                 </div>
 
                 <!-- Right Content Pane -->
@@ -575,7 +580,7 @@
                                         <th>Disk Write</th>
                                         <th>Network Down</th>
                                         <th>Network Up</th>
-                                        <th>Actions</th>
+                                        <th>Alerts</th>
                                     </tr>
                                 </thead>
                                 <tbody id="proc-list-body">
@@ -606,7 +611,8 @@
                     <!-- 4. APPLICATIONS TAB -->
                     <div class="tab-panel" id="services-tab">
                         <div class="proc-controls">
-                            <h3><i class="fa-solid fa-cubes"></i> Applications</h3>
+                            <input type="text" class="search-bar" id="app-search" placeholder="Search applications..."
+                                oninput="filterApplications()">
                             <div style="display: flex; gap: 10px; align-items: center;">
                                 <button class="btn-refresh" onclick="fetchServerApplications()"><i
                                         class="fa-solid fa-rotate"></i> Refresh</button>
@@ -654,7 +660,7 @@
                                         <th>Disk Write</th>
                                         <th>Network Down</th>
                                         <th>Network Up</th>
-                                        <th>Actions</th>
+                                        <th>Alerts</th>
                                     </tr>
                                 </thead>
                                 <tbody id="applications-list-body">
@@ -669,10 +675,27 @@
 
                     <!-- 5. ALERTS TAB -->
                     <div class="tab-panel" id="alerts-tab">
+                        <!-- Non-admin/operator notice -->
+                        <div id="alert-viewer-notice" style="display:none; padding: 20px; text-align:center; color: var(--text-secondary); font-size:13px; background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius:10px; margin-bottom: 16px;">
+                            <i class="fa-solid fa-lock" style="margin-bottom:8px; font-size:20px; opacity:0.4;"></i>
+                            <p style="margin:0;">Only <strong>Admins</strong> and <strong>Operators</strong> can configure alert rules. You can view existing rules below.</p>
+                        </div>
                         <div class="alerts-layout" style="margin-top:0;">
-                            <div class="alert-card">
+                            <div class="alert-card" id="create-alert-card">
                                 <h3><i class="fa-solid fa-bell"></i> Set Rule Condition</h3>
                                 <form id="create-alert-form">
+                                    <div class="form-group">
+                                        <label for="alert-target-type">Alert Scope</label>
+                                        <select id="alert-target-type" class="form-control" onchange="onAlertTargetTypeChange(this, 'create-')">
+                                            <option value="server">Entire Server</option>
+                                            <option value="process">Specific Process</option>
+                                            <option value="application">Specific Application</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group" id="create-alert-target-value-group" style="display:none; margin-top: 10px;">
+                                        <label for="alert-target-value">Process / Application Name</label>
+                                        <input type="text" id="alert-target-value" class="form-control" placeholder="e.g. postgres">
+                                    </div>
                                     <div class="form-group">
                                         <label for="alert-metric">Choose Metric</label>
                                         <select id="alert-metric" class="form-control" onchange="onAlertMetricChange(this, 'create-')">
@@ -686,7 +709,7 @@
                                         <label for="alert-metric-custom">Custom Metric Key</label>
                                         <input type="text" id="alert-metric-custom" class="form-control" placeholder="e.g. swap_used_pct or net_rx_kb">
                                     </div>
-                                    <div class="form-group">
+                                    <div class="form-group" id="create-alert-operator-group">
                                         <label for="alert-operator">Condition</label>
                                         <select id="alert-operator" class="form-control">
                                             <option value=">">Greater than (&gt;)</option>
@@ -697,9 +720,9 @@
                                             <option value="!=">Not equal (!=)</option>
                                         </select>
                                     </div>
-                                    <div class="form-group">
-                                        <label for="alert-threshold">Threshold percentage (%)</label>
-                                        <input type="number" id="alert-threshold" class="form-control" min="1" max="99"
+                                    <div class="form-group" id="create-alert-threshold-group">
+                                        <label for="alert-threshold">Threshold / Limit Value</label>
+                                        <input type="number" id="alert-threshold" class="form-control" min="1" max="9999"
                                             value="90">
                                     </div>
                                     <div class="form-group">
@@ -708,9 +731,26 @@
                                             value="5">
                                     </div>
                                     <div class="form-group">
-                                        <label for="alert-email">Your Email Address</label>
-                                        <input type="email" id="alert-email" class="form-control"
-                                            readonly style="opacity: 0.7; background: rgba(255,255,255,0.05);" required>
+                                        <label for="alert-recipient-type">Send Alerts To</label>
+                                        <select id="alert-recipient-type" class="form-control" onchange="onAlertRecipientTypeChange(this, 'create-')">
+                                            <option value="self">Me (my email)</option>
+                                            <option value="specific">Specific user(s)...</option>
+                                        </select>
+                                    </div>
+                                    <!-- Shown only when 'Me' is selected -->
+                                    <div class="form-group" id="create-alert-email-display-group" style="margin-top: 6px;">
+                                        <label for="alert-email-display" style="opacity:0.7; font-size:12px;">Alert will be sent to:</label>
+                                        <input type="text" id="alert-email-display" class="form-control" readonly style="opacity: 0.7; background: rgba(255,255,255,0.05); font-size:12px;">
+                                    </div>
+                                    <!-- Shown only when 'Specific user(s)' is selected -->
+                                    <div class="form-group" id="create-alert-email-group" style="display:none; margin-top: 10px;">
+                                        <label>GitHub Usernames to notify</label>
+                                        <div style="display:flex; gap:6px; align-items:center;">
+                                            <input type="text" id="alert-user-search" class="form-control" placeholder="Search by GitHub username..." oninput="searchAlertUser(this, 'create-')" style="flex:1;">
+                                        </div>
+                                        <div id="create-alert-user-results" style="margin-top:6px; display:none; background:var(--bg-darker); border:1px solid var(--border-color); border-radius:6px; max-height:120px; overflow-y:auto;"></div>
+                                        <div id="create-alert-user-tags" style="margin-top:8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+                                        <input type="hidden" id="alert-email" value="">
                                     </div>
                                     <button type="submit" class="submit-btn">Set Alert Rules</button>
                                 </form>
@@ -726,7 +766,75 @@
                         </div>
                     </div>
 
-                    <!-- 6. CONTAINERS TAB -->
+                    <!-- 6. COMMANDS TAB -->
+                    <div class="tab-panel" id="commands-tab">
+                        <div class="proc-controls" style="margin-bottom: 18px; padding: 16px 20px; background-color: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 8px; display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <h3 style="margin:0; font-size:15px; color:var(--text-primary); display:flex; align-items:center; gap:10px;">
+                                    <i class="fa-solid fa-terminal" style="color:#38bdf8; font-size:20px;"></i>
+                                    <span>Custom Commands</span>
+                                </h3>
+                                <p style="margin:6px 0 0 0; font-size:12px; color:var(--text-secondary);">
+                                    Configure and execute remote shell commands on this server.
+                                </p>
+                            </div>
+                            <div style="display:flex; gap:8px;">
+                                <button class="btn-refresh" onclick="fetchServerCommands()"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                            </div>
+                        </div>
+
+                        <div id="commands-admin-section" style="display:none;">
+                            <div class="alert-card">
+                                <h3><i class="fa-solid fa-pen"></i> Add / Edit Command Set</h3>
+                                <form id="command-set-form">
+                                    <div class="form-group">
+                                        <label for="cmd-service-name">Service / Group Name</label>
+                                        <input type="text" id="cmd-service-name" class="form-control" placeholder="e.g. PostgreSQL" required>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="cmd-commands-json">Commands JSON <span style="opacity:0.6; font-size:11px;">(key: action name, value: shell command)</span></label>
+                                        <textarea id="cmd-commands-json" class="form-control" rows="6" placeholder='{"start":"sudo systemctl start postgres","stop":"sudo systemctl stop postgres","restart":"sudo systemctl restart postgres","status":"sudo systemctl status postgres"}' style="font-family:var(--font-mono); font-size:12px; resize:vertical;" required></textarea>
+                                    </div>
+                                    <button type="submit" class="submit-btn"><i class="fa-solid fa-save"></i> Save Command Set</button>
+                                    <button type="button" onclick="resetCommandForm()" style="margin-left:8px; background:var(--bg-card); border:1px solid var(--border-color); color:var(--text-primary); padding:10px 20px; border-radius:6px; cursor:pointer; font-weight:600;">Cancel</button>
+                                </form>
+                            </div>
+                        </div>
+
+                        <div class="alert-card" style="margin-top:15px;">
+                            <h3><i class="fa-solid fa-magnifying-glass"></i> Search & Execute Commands</h3>
+                            <div class="form-group" style="margin-top:10px;">
+                                <input type="text" id="cmd-search" class="form-control" placeholder="Search command sets..." oninput="filterCommandSets()" style="margin-bottom:15px;">
+                            </div>
+                            <div id="command-sets-container">
+                                <p style="font-size:13px; color:var(--text-secondary); padding:20px; text-align:center;">Loading command sets...</p>
+                            </div>
+                        </div>
+
+                        <div class="alert-card" style="margin-top:15px;">
+                            <h3><i class="fa-solid fa-clock-rotate-left"></i> Execution Log</h3>
+                            <div style="max-height:300px; overflow-y:auto; margin-top:10px;">
+                                <table class="proc-table" style="font-size:12px;">
+                                    <thead>
+                                        <tr>
+                                            <th>Service</th>
+                                            <th>Action</th>
+                                            <th>Command</th>
+                                            <th>Executed By</th>
+                                            <th>Time</th>
+                                            <th>Duration</th>
+                                            <th>Status</th>
+                                            <th style="width:40px;"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="cmd-log-body">
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 7. CONTAINERS TAB -->
                     <div class="tab-panel" id="containers-tab">
                         <div class="proc-controls"
                             style="margin-bottom: 18px; padding: 16px 20px; background-color: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 8px; display: flex; justify-content: space-between; align-items: center;">
@@ -895,6 +1003,48 @@
             </div>
         </div>
     </div>
+    <!-- SERVER MEMBERS / TEAM ACCESS MODAL -->
+    <div class="modal-overlay" id="team-modal" style="display:none; z-index: 10006;">
+        <div class="modal-card" style="max-width: 550px; width: 90%; padding: 0;">
+            <div class="modal-header" style="border-bottom: 1px solid var(--border-color); padding: 16px 20px;">
+                <h3 style="margin: 0; font-size: 16px; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+                    <i class="fa-solid fa-users-gear"></i> Server Access &amp; Team Settings
+                </h3>
+                <button class="modal-close-btn" onclick="closeTeamModal()"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            
+            <div style="padding: 20px; display: flex; flex-direction: column; gap: 20px;">
+                <!-- Add Member Section (Admin Only) -->
+                <div id="team-invite-section" style="border-bottom: 1px solid var(--border-color); padding-bottom: 20px;">
+                    <h4 style="margin: 0 0 10px 0; font-size: 13px; text-transform: uppercase; color: var(--text-secondary); letter-spacing: 0.5px;">Invite Team Member</h4>
+                    <form id="team-invite-form" onsubmit="handleTeamInvite(event)" style="display: flex; gap: 10px; margin: 0;">
+                        <input type="hidden" id="team-server-id">
+                        <input type="text" id="team-invite-username" class="form-control" placeholder="GitHub Username" required style="flex: 2;">
+                        <select id="team-invite-role" class="form-control" style="flex: 1;">
+                            <option value="viewer">Viewer</option>
+                            <option value="operator">Operator</option>
+                            <option value="admin">Admin</option>
+                        </select>
+                        <button type="submit" style="background: var(--primary); border: none; color: white; padding: 0 16px; border-radius: 6px; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                            <i class="fa-solid fa-user-plus"></i> Invite
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Current Members List -->
+                <div>
+                    <h4 style="margin: 0 0 10px 0; font-size: 13px; text-transform: uppercase; color: var(--text-secondary); letter-spacing: 0.5px;">Users with Access</h4>
+                    <div id="team-members-list" style="display: flex; flex-direction: column; gap: 10px; max-height: 250px; overflow-y: auto; padding-right: 5px;">
+                        <!-- Dynamically populated rows -->
+                    </div>
+                </div>
+            </div>
+            
+            <div style="padding: 12px 20px; border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; background: rgba(0,0,0,0.15);">
+                <button type="button" onclick="closeTeamModal()" style="background: var(--bg-card); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600;">Close</button>
+            </div>
+        </div>
+    </div>
 
     <!-- EDIT ALERT MODAL -->
     <div class="modal-overlay" id="edit-alert-modal" style="display:none; z-index: 10006;">
@@ -908,10 +1058,22 @@
             <form id="edit-alert-form" onsubmit="handleEditAlertSubmit(event)">
                 <input type="hidden" id="edit-alert-id">
                 <input type="hidden" id="edit-alert-server-id">
-                <div style="padding: 20px; display: flex; flex-direction: column; gap: 15px;">
+                <div style="padding: 20px; display: flex; flex-direction: column; gap: 15px; overflow-y: auto; max-height: calc(80vh - 130px);">
                     <div class="form-group">
                         <label for="edit-alert-server" style="display:block; margin-bottom:5px; font-weight:600;">Server Node</label>
                         <input type="text" id="edit-alert-server" class="form-control" readonly style="opacity: 0.7; background: rgba(255,255,255,0.05);">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-alert-target-type" style="display:block; margin-bottom:5px; font-weight:600;">Alert Scope</label>
+                        <select id="edit-alert-target-type" class="form-control" onchange="onAlertTargetTypeChange(this, 'edit-')">
+                            <option value="server">Entire Server</option>
+                            <option value="process">Specific Process</option>
+                            <option value="application">Specific Application</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="edit-alert-target-value-group" style="display:none; margin-top: 10px;">
+                        <label for="edit-alert-target-value" style="display:block; margin-bottom:5px; font-weight:600;">Process / Application Name</label>
+                        <input type="text" id="edit-alert-target-value" class="form-control" placeholder="e.g. postgres">
                     </div>
                     <div class="form-group">
                         <label for="edit-alert-metric" style="display:block; margin-bottom:5px; font-weight:600;">Metric</label>
@@ -926,7 +1088,7 @@
                         <label for="edit-alert-metric-custom" style="display:block; margin-bottom:5px; font-weight:600;">Custom Metric Key</label>
                         <input type="text" id="edit-alert-metric-custom" class="form-control" placeholder="e.g. swap_used_pct or net_rx_kb">
                     </div>
-                    <div class="form-group">
+                    <div class="form-group" id="edit-alert-operator-group">
                         <label for="edit-alert-operator" style="display:block; margin-bottom:5px; font-weight:600;">Condition</label>
                         <select id="edit-alert-operator" class="form-control">
                             <option value=">">Greater than (&gt;)</option>
@@ -937,17 +1099,35 @@
                             <option value="!=">Not equal (!=)</option>
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label for="edit-alert-threshold" style="display:block; margin-bottom:5px; font-weight:600;">Threshold percentage (%)</label>
-                        <input type="number" id="edit-alert-threshold" class="form-control" min="1" max="99" required>
+                    <div class="form-group" id="edit-alert-threshold-group">
+                        <label for="edit-alert-threshold" style="display:block; margin-bottom:5px; font-weight:600;">Threshold / Limit Value</label>
+                        <input type="number" id="edit-alert-threshold" class="form-control" min="1" max="9999" required>
                     </div>
                     <div class="form-group">
                         <label for="edit-alert-duration" style="display:block; margin-bottom:5px; font-weight:600;">Alert after duration (minutes)</label>
                         <input type="number" id="edit-alert-duration" class="form-control" min="1" max="60" required>
                     </div>
                     <div class="form-group">
-                        <label for="edit-alert-email" style="display:block; margin-bottom:5px; font-weight:600;">Recipient Email Address</label>
-                        <input type="email" id="edit-alert-email" class="form-control" readonly style="opacity: 0.7; background: rgba(255,255,255,0.05);" required>
+                        <label for="edit-alert-recipient-type" style="display:block; margin-bottom:5px; font-weight:600;">Send Alerts To</label>
+                        <select id="edit-alert-recipient-type" class="form-control" onchange="onAlertRecipientTypeChange(this, 'edit-')">
+                            <option value="self">Me (my email)</option>
+                            <option value="specific">Specific user(s)...</option>
+                        </select>
+                    </div>
+                    <!-- Shown only when 'Me' is selected -->
+                    <div class="form-group" id="edit-alert-email-display-group" style="margin-top: 5px;">
+                        <label for="edit-alert-email-display" style="display:block; margin-bottom:5px; font-weight:600; opacity:0.7; font-size:12px;">Alert will be sent to:</label>
+                        <input type="text" id="edit-alert-email-display" class="form-control" readonly style="opacity: 0.7; background: rgba(255,255,255,0.05); font-size:12px;">
+                    </div>
+                    <!-- Shown only when 'Specific user(s)' is selected -->
+                    <div class="form-group" id="edit-alert-email-group" style="display:none; margin-top:5px;">
+                        <label style="display:block; margin-bottom:5px; font-weight:600;">GitHub Usernames to notify</label>
+                        <div style="display:flex; gap:6px; align-items:center;">
+                            <input type="text" id="edit-alert-user-search" class="form-control" placeholder="Search by GitHub username..." oninput="searchAlertUser(this, 'edit-')" style="flex:1;">
+                        </div>
+                        <div id="edit-alert-user-results" style="margin-top:6px; display:none; background:var(--bg-darker); border:1px solid var(--border-color); border-radius:6px; max-height:120px; overflow-y:auto;"></div>
+                        <div id="edit-alert-user-tags" style="margin-top:8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+                        <input type="hidden" id="edit-alert-email" value="">
                     </div>
                     <div class="form-group" style="display: flex; align-items: center; gap: 10px; margin-top: 5px;">
                         <input type="checkbox" id="edit-alert-active" style="width: 16px; height: 16px; cursor: pointer;">
@@ -967,9 +1147,9 @@
 
 
     <!-- Modular JS Files -->
-    <script src="/static/js/charts.js?v=1.2.1"></script>
-    <script src="/static/js/components.js?v=1.2.1"></script>
-    <script src="/static/js/app.js?v=1.2.1"></script>
+    <script src="/static/js/charts.js?v=1.2.2"></script>
+    <script src="/static/js/components.js?v=1.2.2"></script>
+    <script src="/static/js/app.js?v=1.2.2"></script>
 </body>
 
 </html>

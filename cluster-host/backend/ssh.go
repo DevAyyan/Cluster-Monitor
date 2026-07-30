@@ -6,11 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
-	"net/http"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,88 +111,12 @@ var agentHTTPClient = &http.Client{
 }
 
 func doAgentRequest(info serverSSHInfo, path string) ([]byte, error) {
-	client := agentHTTPClient
-
-	// Check if direct HTTP was recently tested and marked unreachable (within 30s)
-	reachable, known := checkDirectReachable(info.Host)
-	if !known || reachable {
-		hostsToTry := []string{info.Host}
-		if isLocalHost(info) {
-			hostsToTry = append(hostsToTry, "172.17.0.1", "host.docker.internal")
-		}
-
-		for _, h := range hostsToTry {
-			if h == "" {
-				continue
-			}
-			url := fmt.Sprintf("http://%s:59191/api/v1/%s", h, path)
-			resp, err := client.Get(url)
-			if err == nil {
-				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					setDirectReachable(info.Host, true)
-					return io.ReadAll(resp.Body)
-				}
-			}
-		}
-		// Direct HTTP failed — cache unreachable for 30s to prevent log spam and 1s latency per request
-		setDirectReachable(info.Host, false)
-		log.Printf("[agent-request] Direct HTTP port 59191 unavailable for %s/%s, using SSH fallback (cached 30s)", info.Host, path)
-	}
-
-	// Fallback to SSH execution on the remote host
-	sshCmd := fmt.Sprintf("curl -s http://localhost:59191/api/v1/%s", path)
-	out, errSSH := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, sshCmd)
-	if errSSH == nil && len(out) > 0 {
-		return []byte(out), nil
-	}
-
-	return nil, fmt.Errorf("target agent unreachable via SSH fallback: %v", errSSH)
+	return wsManager.SendCommand(info.ServerID, "GET", path, nil)
 }
 
-// doAgentPostRequest sends a POST with a JSON body to the agent, prioritizing direct agent HTTP.
+// doAgentPostRequest sends a POST with a JSON body to the agent.
 func doAgentPostRequest(info serverSSHInfo, path string, body []byte) ([]byte, error) {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{Timeout: 1000 * time.Millisecond}).DialContext,
-		},
-		Timeout: 5 * time.Second,
-	}
-
-	// Only try docker-bridge fallback addresses when the target is this local machine.
-	hostsToTry := []string{info.Host}
-	if isLocalHost(info) {
-		hostsToTry = append(hostsToTry, "172.17.0.1", "host.docker.internal")
-	}
-	var lastErr error
-	for _, h := range hostsToTry {
-		if h == "" {
-			continue
-		}
-		url := fmt.Sprintf("http://%s:59191/api/v1/%s", h, path)
-		resp, err := client.Post(url, "application/json", bytes.NewReader(body))
-		if err == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				setDirectReachable(info.Host, true)
-				return io.ReadAll(resp.Body)
-			}
-			lastErr = fmt.Errorf("status %d", resp.StatusCode)
-		} else {
-			lastErr = err
-		}
-	}
-
-	// SSH fallback — use curl with the JSON body if direct agent port is blocked
-	sshCmd := fmt.Sprintf(
-		`curl -s -X POST -H 'Content-Type: application/json' -d '%s' http://localhost:59191/api/v1/%s`,
-		strings.ReplaceAll(string(body), "'", `'\''`), path,
-	)
-	out, errSSH := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, sshCmd)
-	if errSSH == nil && len(out) > 0 {
-		return []byte(out), nil
-	}
-	return nil, fmt.Errorf("target agent action failed (http: %v, ssh: %v)", lastErr, errSSH)
+	return wsManager.SendCommand(info.ServerID, "POST", path, body)
 }
 
 // hostBindAddr is the interface the Host listener binds to (default "" => all).
@@ -363,6 +288,34 @@ func getOrCreateSSHClient(serverID, user, password, key, host string, port int) 
 // runSSHCommand reuses active SSH connections and opens a new session per command.
 // Retries once automatically on transient session errors.
 func runSSHCommand(serverID, user, password, key, host string, port int, command string) (string, error) {
+	// If the server has an active WebSocket connection, route it directly over the WebSocket!
+	if serverID != "" && serverID != "test" {
+		if _, online := wsManager.Get(serverID); online {
+			log.Printf("[ws-proxy-exec] Routing command over WebSocket to server %s: %s", serverID, command)
+			reqBody, err := json.Marshal(map[string]string{"command": command})
+			if err != nil {
+				return "", fmt.Errorf("failed to marshal request payload: %w", err)
+			}
+			respBytes, err := wsManager.SendCommand(serverID, "POST", "exec-command", reqBody)
+			if err != nil {
+				return "", err
+			}
+			var resp struct {
+				Ok     bool   `json:"ok"`
+				Output string `json:"output"`
+			}
+			if err := json.Unmarshal(respBytes, &resp); err != nil {
+				return string(respBytes), nil // Return raw response if parsing fails
+			}
+			// When the command ran but returned a non-zero exit code, return the
+			// output as the error so the caller can display the real failure reason.
+			if !resp.Ok {
+				return resp.Output, fmt.Errorf("%s", strings.TrimSpace(resp.Output))
+			}
+			return resp.Output, nil
+		}
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		client, err := getOrCreateSSHClient(serverID, user, password, key, host, port)
@@ -382,7 +335,10 @@ func runSSHCommand(serverID, user, password, key, host string, port int, command
 			lastErr = err
 			continue
 		}
-		output, err := session.CombinedOutput(command)
+		cmdBash := "export PATH=$PATH:/usr/bin:/usr/local/bin:/usr/sbin:/sbin; " + command
+		fullCmd := fmt.Sprintf("exec /bin/bash -c %s 2>/dev/null || exec bash -c %s 2>/dev/null || exec /bin/sh -c %s || exec sh -c %s",
+			shellQuote(cmdBash), shellQuote(cmdBash), shellQuote(cmdBash), shellQuote(cmdBash))
+		output, err := session.CombinedOutput(fullCmd)
 		session.Close()
 		if err != nil {
 			lastErr = err
@@ -500,7 +456,7 @@ func sshGetContainers(info serverSSHInfo) (map[string]interface{}, error) {
 	}
 
 	// Fallback to raw SSH execution if agent fails
-	cmd := `docker version --format 'Docker Engine v{{.Server.Version}} (API v{{.Server.APIVersion}})' 2>/dev/null; echo "---INFO---"; docker info --format '{{.Name}} | {{.OperatingSystem}} ({{.KernelVersion}})' 2>/dev/null; echo "---CONTAINERS---"; docker ps -a --format '{"id":"{{.ID}}","name":"{{.Names}}","status":"{{.Status}}","state":"{{.State}}","image":"{{.Image}}","ports":"{{.Ports}}","created":"{{.CreatedAt}}"}' 2>/dev/null; echo "---IMAGES---"; docker images --format '{"repo":"{{.Repository}}","tag":"{{.Tag}}","id":"{{.ID}}","created":"{{.CreatedAt}}","size":"{{.Size}}"}' 2>/dev/null`
+	cmd := `export PATH=$PATH:/usr/bin:/usr/local/bin:/usr/sbin:/sbin; docker version --format 'Docker Engine v{{.Server.Version}} (API v{{.Server.APIVersion}})' 2>/dev/null; echo "---INFO---"; docker info --format '{{.Name}} | {{.OperatingSystem}} ({{.KernelVersion}})' 2>/dev/null; echo "---CONTAINERS---"; docker ps -a --format '{"id":"{{.ID}}","name":"{{.Names}}","status":"{{.Status}}","state":"{{.State}}","image":"{{.Image}}","ports":"{{.Ports}}","created":"{{.CreatedAt}}"}' 2>/dev/null; echo "---IMAGES---"; docker images --format '{"repo":"{{.Repository}}","tag":"{{.Tag}}","id":"{{.ID}}","created":"{{.CreatedAt}}","size":"{{.Size}}"}' 2>/dev/null`
 	out, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd)
 	if err != nil {
 		return map[string]interface{}{"containers": []map[string]interface{}{}, "images": []map[string]interface{}{}}, nil
@@ -664,6 +620,14 @@ func parseStorageOutput(out string) ([]map[string]interface{}, error) {
 
 // sshGetDockerInfo returns Docker version + images list.
 func sshGetDockerInfo(info serverSSHInfo) (map[string]interface{}, error) {
+	data, err := doAgentRequest(info, "docker-info")
+	if err == nil {
+		var res map[string]interface{}
+		if errUnmarshal := json.Unmarshal(data, &res); errUnmarshal == nil {
+			return res, nil
+		}
+	}
+
 	verCmd := `docker version --format '{{json .}}' 2>/dev/null || echo '{"error":"no docker"}'`
 	imgCmd := `docker images --format '{{json .}}' 2>/dev/null`
 	outVer, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, verCmd)
@@ -687,8 +651,12 @@ func sshGetDockerInfo(info serverSSHInfo) (map[string]interface{}, error) {
 	}, nil
 }
 
-// sshGetNetworkConnections returns active TCP/UDP connections from /proc/net/{tcp,udp}.
 func sshGetNetworkConnections(info serverSSHInfo) (map[string]interface{}, error) {
+	data, err := doAgentRequest(info, "network-connections")
+	if err == nil {
+		return parseNetworkConnections(string(data)), nil
+	}
+
 	cmd := `echo '---TCP---'; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; echo '---UDP---'; cat /proc/net/udp /proc/net/udp6 2>/dev/null`
 	out, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd)
 	if err != nil {
@@ -766,7 +734,7 @@ func decodeTCPState(state string) string {
 // sshDockerRun runs a docker command on the target (start/stop/restart/logs/compose).
 func sshDockerRun(info serverSSHInfo, cmdStr string) (string, error) {
 	escaped := strings.ReplaceAll(cmdStr, "'", "'\\''")
-	sshCmd := fmt.Sprintf("docker %s 2>&1", escaped)
+	sshCmd := fmt.Sprintf("export PATH=$PATH:/usr/bin:/usr/local/bin:/usr/sbin:/sbin; docker %s 2>&1", escaped)
 	out, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, sshCmd)
 	if err != nil {
 		return out, err
@@ -1280,79 +1248,110 @@ func shellQuote(s string) string {
 // to ship to external servers. Override with AGENT_ASSETS_DIR env if needed.
 var agentAssetsDir = "agent_assets"
 
-// sshInstallAgent drops the agent binary + systemd unit onto the target and
-// (re)starts the service. This is the "1-2 files" footprint: a single static
-// binary at /usr/local/bin/cluster-target and one unit file. No Docker.
-func sshInstallAgent(info serverSSHInfo, serverID string) error {
-	binLocal := agentAssetsDir + "/cluster-target"
-	unitLocal := agentAssetsDir + "/cluster-target.service"
+// sshInstallAgent cross-deploys the correct pre-built agent binary to the
+// target server. It:
+//  1. Detects the target's OS/arch via SSH
+//  2. SCPs ONLY the matching binary (nothing else)
+//  3. Runs the binary once with SERVER_ID, AGENT_TOKEN, HOST_ENDPOINT as env vars
+//
+// The binary's selfInstallService() then writes its own systemd unit with all
+// three credentials embedded and starts itself — no external config files needed.
+func sshInstallAgent(info serverSSHInfo, serverID string, endpoint string) error {
+	// --- Step 1: Detect target OS and CPU architecture ---
+	osOut, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, "uname -s 2>/dev/null || echo Linux")
+	if err != nil {
+		return fmt.Errorf("detect OS: %w", err)
+	}
+	archOut, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, "uname -m 2>/dev/null || echo x86_64")
+	if err != nil {
+		return fmt.Errorf("detect arch: %w", err)
+	}
 
+	osName := strings.ToLower(strings.TrimSpace(osOut))
+	archRaw := strings.ToLower(strings.TrimSpace(archOut))
+
+	goos := "linux"
+	switch {
+	case strings.Contains(osName, "darwin"):
+		goos = "darwin"
+	case strings.Contains(osName, "windows"), strings.Contains(osName, "mingw"):
+		goos = "windows"
+	}
+
+	goarch := "amd64"
+	if archRaw == "aarch64" || archRaw == "arm64" || strings.HasPrefix(archRaw, "arm") {
+		goarch = "arm64"
+	}
+
+	// --- Step 2: Pick the correct pre-built binary ---
+	binName := fmt.Sprintf("cluster-target-%s-%s", goos, goarch)
+	if goos == "windows" {
+		binName += ".exe"
+	}
+	binLocal := filepath.Join(agentAssetsDir, binName)
 	if _, err := os.Stat(binLocal); err != nil {
-		// No bundled binary: skip install, SSH-pull still works.
-		log.Printf("[agent-bootstrap] no bundled binary at %s; skipping install (SSH-pull only): %v", binLocal, err)
-		return nil
+		return fmt.Errorf("no pre-built binary for %s/%s at %s: %w", goos, goarch, binLocal, err)
 	}
-	if _, err := os.Stat(unitLocal); err != nil {
-		log.Printf("[agent-bootstrap] no bundled unit at %s; skipping install: %v", unitLocal, err)
-		return nil
-	}
+	log.Printf("[agent-bootstrap] deploying %s to %s (%s/%s)", binName, info.Host, goos, goarch)
 
-	// 1. Copy binary and unit file.
-	if err := scpFile(info, binLocal, "/usr/local/bin/cluster-target", 0755); err != nil {
+	// --- Step 3: SCP ONLY the binary to ~/.local/bin/ ---
+	remoteBin := "~/.local/bin/cluster-target"
+	setupDir := "mkdir -p ~/.local/bin"
+	if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, setupDir); err != nil {
+		return fmt.Errorf("mkdir ~/.local/bin: %w", err)
+	}
+	if err := scpFile(info, binLocal, "/tmp/cluster-target-new", 0755); err != nil {
 		return fmt.Errorf("scp binary: %w", err)
 	}
-	if err := scpFile(info, unitLocal, "/etc/systemd/system/cluster-target.service", 0644); err != nil {
-		return fmt.Errorf("scp unit: %w", err)
+	if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port,
+		fmt.Sprintf("mv /tmp/cluster-target-new %s && chmod +x %s", remoteBin, remoteBin)); err != nil {
+		return fmt.Errorf("install binary: %w", err)
 	}
 
-	// 1b. Write the agent environment file (SERVER_ID) so the systemd unit
-	// can pass it to the binary.
-	envContents := fmt.Sprintf("SERVER_ID=%s\n", serverID)
-	envCmd := fmt.Sprintf(`sudo mkdir -p /etc/cluster-target && printf %s | sudo tee /etc/cluster-target/environment >/dev/null`,
-		quotePath(envContents))
+	// --- Step 4: Look up the agent token ---
+	var agentToken string
+	_ = db.QueryRow("SELECT agent_token FROM servers WHERE id=$1", serverID).Scan(&agentToken)
 
-	// 2. Enable + start (or restart) the silent service.
-	cmds := []string{
-		envCmd,
-		"sudo systemctl daemon-reload",
-		fmt.Sprintf("sudo systemctl enable --now cluster-target.service 2>&1 || sudo systemctl restart cluster-target.service 2>&1"),
+	// --- Step 5: Run the binary ONCE with env vars ---
+	// selfInstallService() inside the binary writes its own systemd unit with all
+	// credentials embedded and starts the persistent service. Nothing else is needed.
+	runCmd := fmt.Sprintf(
+		"SERVER_ID=%s AGENT_TOKEN=%s HOST_ENDPOINT=%s nohup %s > /tmp/cluster-target-install.log 2>&1 &",
+		shellQuote(serverID), shellQuote(agentToken), shellQuote(endpoint), remoteBin,
+	)
+	if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, runCmd); err != nil {
+		return fmt.Errorf("launch agent: %w", err)
 	}
-	for _, c := range cmds {
-		if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, c); err != nil {
-			return fmt.Errorf("install step (%s): %w", c, err)
-		}
-	}
-	log.Printf("[agent-bootstrap] agent installed+started on %s", info.Host)
+
+	log.Printf("[agent-bootstrap] agent binary installed and launched on %s — self-install will start the service", info.Host)
 	return nil
 }
 
 // sshAgentAddEndpoint tells the target agent to start pushing to the Host endpoint.
-// It does this over SSH by calling the agent's local /api/v1/endpoint API via
-// systemd-run (no open inbound port needed from Host's perspective).
+// It writes the host URL directly into the agent's `~/.config/cluster-target/endpoints` file
+// then restarts the service so it picks it up immediately.
 func sshAgentAddEndpoint(info serverSSHInfo, endpoint string) error {
 	if endpoint == "" {
 		return nil
 	}
-	var payload string
-	if previousHostEndpoint != "" && previousHostEndpoint != endpoint {
-		payload = fmt.Sprintf(`{"action":"replace","old_url":%q,"url":%q}`, previousHostEndpoint, endpoint)
-	} else {
-		payload = fmt.Sprintf(`{"action":"add","url":%q}`, endpoint)
+	cmds := []string{
+		fmt.Sprintf(`mkdir -p ~/.config/cluster-target && echo %s > ~/.config/cluster-target/endpoints`, quotePath(endpoint)),
+		`systemctl --user restart cluster-target.service 2>&1 || true`,
 	}
-	cmd := fmt.Sprintf(`curl -s -X POST http://localhost:59191/api/v1/endpoint -H 'Content-Type: application/json' -d '%s' 2>/dev/null || true`, strings.ReplaceAll(payload, "'", `'\''`))
-	if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd); err != nil {
-		return fmt.Errorf("add endpoint: %w", err)
+	for _, c := range cmds {
+		if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, c); err != nil {
+			return fmt.Errorf("add endpoint: %w", err)
+		}
 	}
 	return nil
 }
 
 // sshAgentRemoveEndpoint removes the Host endpoint from the target agent.
-// The agent keeps running; only its endpoint list is trimmed.
 func sshAgentRemoveEndpoint(info serverSSHInfo, endpoint string) error {
 	if endpoint == "" {
 		return nil
 	}
-	cmd := fmt.Sprintf(`curl -s -X POST http://localhost:59191/api/v1/endpoint -H 'Content-Type: application/json' -d '{"action":"remove","url":%q}' 2>/dev/null || true`, endpoint)
+	cmd := `rm -f ~/.config/cluster-target/endpoints`
 	if _, err := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd); err != nil {
 		return fmt.Errorf("remove endpoint: %w", err)
 	}

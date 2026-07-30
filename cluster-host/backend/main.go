@@ -23,26 +23,27 @@ import (
 )
 
 var (
-	db          *sql.DB
-	uuidRegex   = regexp.MustCompile(`^[a-fA-F0-9\-]{36}$`)
-	actionRegex = regexp.MustCompile(`^(start|stop|restart|status)$`)
+	db           *sql.DB
+	uuidRegex    = regexp.MustCompile(`^[a-fA-F0-9\-]{36}$`)
+	actionRegex  = regexp.MustCompile(`^(start|stop|restart|status)$`)
 	serviceRegex = regexp.MustCompile(`^[a-zA-Z0-9\.\-_]+$`)
 )
 
 // Structs representing database entities
 type Server struct {
-	ID         string    `json:"id"`
-	Hostname   string    `json:"hostname"`
-	IPAddress  string    `json:"ip_address"`
-	OSFamily   string    `json:"os_family"`
-	AgentToken string    `json:"agent_token,omitempty"`
+	ID          string    `json:"id"`
+	Hostname    string    `json:"hostname"`
+	IPAddress   string    `json:"ip_address"`
+	OSFamily    string    `json:"os_family"`
+	AgentToken  string    `json:"agent_token,omitempty"`
 	SSHUser     string    `json:"ssh_user,omitempty"`
 	SSHKey      string    `json:"ssh_key,omitempty"`
 	SSHPassword string    `json:"ssh_password,omitempty"`
 	SSHPort     int       `json:"ssh_port,omitempty"`
-	Status     string    `json:"status"`
-	LastSeen   time.Time `json:"last_seen"`
-	CreatedAt  time.Time `json:"created_at"`
+	Status      string    `json:"status"`
+	LastSeen    time.Time `json:"last_seen"`
+	CreatedAt   time.Time `json:"created_at"`
+	Role        string    `json:"role,omitempty"`
 }
 
 type MonitoredService struct {
@@ -60,9 +61,12 @@ type AlertRule struct {
 	Threshold       float64      `json:"threshold"`        // e.g. 90.0
 	DurationMinutes int          `json:"duration_minutes"` // e.g. 5
 	RecipientEmail  string       `json:"recipient_email"`
+	RecipientType   string       `json:"recipient_type"` // "self", "specific", "all"
 	IsActive        bool         `json:"is_active"`
 	LastTriggered   sql.NullTime `json:"last_triggered"`
 	IsFiring        bool         `json:"is_firing"`
+	TargetType      string       `json:"target_type"`  // "server", "process", "application"
+	TargetValue     string       `json:"target_value"` // e.g. "postgres"
 }
 
 type MonitoredProcess struct {
@@ -77,6 +81,28 @@ type MonitoredApplication struct {
 	ID              int    `json:"id"`
 	ServerID        string `json:"server_id"`
 	ApplicationName string `json:"application_name"`
+}
+
+type CustomCommandSet struct {
+	ID          int               `json:"id"`
+	ServerID    string            `json:"server_id"`
+	ServiceName string            `json:"service_name"`
+	Commands    map[string]string `json:"commands"`
+	CreatedBy   string            `json:"created_by"`
+	UpdatedAt   time.Time         `json:"updated_at"`
+}
+
+type CommandExecutionLog struct {
+	ID          int       `json:"id"`
+	ServerID    string    `json:"server_id"`
+	ServiceName string    `json:"service_name"`
+	CommandType string    `json:"command_type"`
+	Command     string    `json:"command"`
+	ExecutedBy  string    `json:"executed_by"`
+	ExecutedAt  time.Time `json:"executed_at"`
+	Status      string    `json:"status"`
+	Output      string    `json:"output"`
+	DurationMs  int       `json:"duration_ms"`
 }
 
 func initDatabase() {
@@ -249,6 +275,31 @@ func initDatabase() {
 		`CREATE INDEX IF NOT EXISTS idx_alert_rules_server_id ON alert_rules(server_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_servers_status ON servers(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_server_members_user ON server_members(username);`,
+		`ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS target_type VARCHAR(50) DEFAULT 'server';`,
+		`ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS target_value VARCHAR(255) DEFAULT '';`,
+		`ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS recipient_type VARCHAR(50) DEFAULT 'self';`,
+		`CREATE TABLE IF NOT EXISTS custom_commands (
+			id SERIAL PRIMARY KEY,
+			server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+			service_name VARCHAR(255) NOT NULL,
+			commands JSONB NOT NULL,
+			created_by VARCHAR(255) NOT NULL,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			CONSTRAINT unique_server_service_command UNIQUE(server_id, service_name)
+		);`,
+		`CREATE TABLE IF NOT EXISTS command_execution_log (
+			id SERIAL PRIMARY KEY,
+			server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+			service_name VARCHAR(255) NOT NULL,
+			command_type VARCHAR(50) NOT NULL,
+			command TEXT NOT NULL,
+			executed_by VARCHAR(255) NOT NULL,
+			executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			status VARCHAR(50) DEFAULT 'pending',
+			output TEXT
+		);`,
+		`ALTER TABLE command_execution_log ADD COLUMN IF NOT EXISTS duration_ms INTEGER DEFAULT 0;`,
+		`ALTER TABLE server_members ADD COLUMN IF NOT EXISTS email VARCHAR(255) DEFAULT '';`,
 	}
 	for _, q := range migrationQueries {
 		if _, err := db.Exec(q); err != nil {
@@ -265,24 +316,102 @@ func initDatabase() {
 	_, _ = db.Exec("DELETE FROM recently_viewed WHERE server_id = '11111111-1111-1111-1111-111111111111'")
 	_, _ = db.Exec("DELETE FROM servers WHERE id = '11111111-1111-1111-1111-111111111111'")
 
-	// Always ensure permanent Localhost server node exists
+	// Purge permanent Localhost server node if it exists
 	localhostID := "00000000-0000-0000-0000-000000000001"
-	var exists int
-	err = db.QueryRow("SELECT COUNT(*) FROM servers WHERE id = $1", localhostID).Scan(&exists)
-	if err == nil && exists == 0 {
-		hostName := "Localhost Node"
-		if hn, hnErr := os.Hostname(); hnErr == nil && hn != "" {
-			hostName = fmt.Sprintf("Localhost (%s)", hn)
-		}
-		_, err = db.Exec("INSERT INTO servers (id, hostname, ip_address, os_family, agent_token, status, last_seen) VALUES ($1, $2, '127.0.0.1', 'linux', 'localhost_token', 'online', NOW())",
-			localhostID, hostName)
-		if err == nil {
-			log.Println("Initialized permanent Localhost server node.")
-		}
-	} else {
-		// Keep status online and update last_seen for Localhost node
-		_, _ = db.Exec("UPDATE servers SET status = 'online', last_seen = NOW() WHERE id = $1", localhostID)
+	_, _ = db.Exec("DELETE FROM server_members WHERE server_id = $1", localhostID)
+	_, _ = db.Exec("DELETE FROM servers WHERE id = $1", localhostID)
+
+	// Normalize all member usernames to lowercase in DB
+	_, _ = db.Exec("UPDATE server_members SET username = LOWER(username)")
+	// Deduplicate: after lowercasing, keep only the row with the highest role per (server_id, username)
+	// Role priority: admin > operator > member > viewer (encoded as CASE order)
+	_, _ = db.Exec(`
+		DELETE FROM server_members
+		WHERE id NOT IN (
+			SELECT DISTINCT ON (server_id, username) id
+			FROM server_members
+			ORDER BY server_id, username,
+				CASE role
+					WHEN 'admin' THEN 1
+					WHEN 'operator' THEN 2
+					WHEN 'member' THEN 3
+					ELSE 4
+				END ASC
+		)
+	`)
+}
+
+// handleAgentSelfRegister is called by the install script on a fresh server.
+// It requires no SSH credentials and no session — the agent supplies its own
+// hostname, IP, and OS family. The Host assigns (or reuses) a SERVER_ID and
+// AGENT_TOKEN and returns them so the agent can write its own config files.
+func handleAgentSelfRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
 	}
+
+	var payload struct {
+		Hostname   string `json:"hostname"`
+		IPAddress  string `json:"ip_address"`
+		OSFamily   string `json:"os_family"`
+		AgentToken string `json:"agent_token"` // optional: reuse existing token
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	payload.Hostname = strings.TrimSpace(payload.Hostname)
+	payload.IPAddress = strings.TrimSpace(payload.IPAddress)
+	payload.OSFamily = strings.ToLower(strings.TrimSpace(payload.OSFamily))
+	if payload.Hostname == "" || payload.IPAddress == "" {
+		http.Error(w, "hostname and ip_address are required", http.StatusBadRequest)
+		return
+	}
+	if payload.OSFamily == "" {
+		payload.OSFamily = "linux"
+	}
+
+	// Reuse existing server record if hostname matches
+	var existingID, existingToken string
+	err := db.QueryRow("SELECT id, COALESCE(agent_token,'') FROM servers WHERE hostname = $1", payload.Hostname).Scan(&existingID, &existingToken)
+	if err == nil && existingID != "" {
+		// Update IP / OS family, keep existing token
+		token := existingToken
+		if token == "" {
+			token = uuid.New().String()
+			_, _ = db.Exec("UPDATE servers SET agent_token = $1 WHERE id = $2", token, existingID)
+		}
+		_, _ = db.Exec("UPDATE servers SET ip_address = $1, os_family = $2, last_seen = NOW() WHERE id = $3",
+			payload.IPAddress, payload.OSFamily, existingID)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":      "updated",
+			"id":          existingID,
+			"agent_token": token,
+		})
+		return
+	}
+
+	// New server — generate credentials
+	newID := uuid.New().String()
+	token := payload.AgentToken
+	if token == "" {
+		token = uuid.New().String()
+	}
+	_, err = db.Exec("INSERT INTO servers (id, hostname, ip_address, os_family, agent_token, status) VALUES ($1, $2, $3, $4, $5, 'online')",
+		newID, payload.Hostname, payload.IPAddress, payload.OSFamily, token)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to register: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":      "registered",
+		"id":          newID,
+		"agent_token": token,
+	})
 }
 
 // 1. Server Registration API
@@ -332,6 +461,22 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		payload.SSHPort = 22
 	}
 
+	if payload.AgentToken == "" {
+		var existingToken sql.NullString
+		_ = db.QueryRow("SELECT agent_token FROM servers WHERE hostname = $1", payload.Hostname).Scan(&existingToken)
+		if existingToken.Valid && existingToken.String != "" {
+			payload.AgentToken = existingToken.String
+		} else {
+			payload.AgentToken = uuid.New().String()
+		}
+	}
+
+	session, _ := getSession(r)
+	var username string
+	if session != nil {
+		username = session.Username
+	}
+
 	// Check if already registered
 	var existingID string
 	err := db.QueryRow("SELECT id FROM servers WHERE hostname = $1", payload.Hostname).Scan(&existingID)
@@ -344,27 +489,43 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-	// Hybrid: (re)install agent + register Host endpoint over SSH (best-effort,
-	// run async so registration never blocks on a slow/failing SSH handshake).
-	go bootstrapAgentOverSSH(existingID, payload.IPAddress, payload.OSFamily, payload.SSHUser, payload.SSHPassword, payload.SSHKey, payload.SSHPort)
+		if username != "" {
+			_, _ = db.Exec("UPDATE servers SET owner_id = $1 WHERE id = $2 AND owner_id IS NULL", strings.ToLower(username), existingID)
+			_, _ = db.Exec("INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, 'admin') ON CONFLICT (server_id, username) DO UPDATE SET role = 'admin'", existingID, strings.ToLower(username))
+		}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "updated",
-		"id":      existingID,
-		"message": "Server metrics, configurations, and SSH credentials updated.",
-	})
-	return
-}
+		// Hybrid: (re)install agent + register Host endpoint over SSH (best-effort,
+		// run async so registration never blocks on a slow/failing SSH handshake).
+		go bootstrapAgentOverSSH(existingID, payload.IPAddress, payload.OSFamily, payload.SSHUser, payload.SSHPassword, payload.SSHKey, payload.SSHPort)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "updated",
+			"id":      existingID,
+			"message": "Server metrics, configurations, and SSH credentials updated.",
+		})
+		return
+	}
 
 	// Generate UUID
 	serverID := uuid.New().String()
 
-	_, err = db.Exec("INSERT INTO servers (id, hostname, ip_address, os_family, agent_token, ssh_user, ssh_key, ssh_password, ssh_port, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'online')",
-		serverID, payload.Hostname, payload.IPAddress, payload.OSFamily, payload.AgentToken, payload.SSHUser, payload.SSHKey, payload.SSHPassword, payload.SSHPort)
+	var ownerParam interface{}
+	if username != "" {
+		ownerParam = username
+	} else {
+		ownerParam = nil
+	}
+
+	_, err = db.Exec("INSERT INTO servers (id, hostname, ip_address, os_family, agent_token, ssh_user, ssh_key, ssh_password, ssh_port, status, owner_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'online', $10)",
+		serverID, payload.Hostname, payload.IPAddress, payload.OSFamily, payload.AgentToken, payload.SSHUser, payload.SSHKey, payload.SSHPassword, payload.SSHPort, ownerParam)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to register server: %v", err), http.StatusInternalServerError)
 		return
+	}
+
+	if username != "" {
+		_, _ = db.Exec("INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, 'admin') ON CONFLICT (server_id, username) DO UPDATE SET role = 'admin'", serverID, strings.ToLower(username))
 	}
 
 	// Hybrid: install agent + register Host endpoint over SSH (best-effort,
@@ -388,16 +549,15 @@ func bootstrapAgentOverSSH(serverID, host, osFamily, user, password, key string,
 		return // demo server: no agent install
 	}
 	info := serverSSHInfo{ServerID: serverID, User: user, Password: password, Key: key, Host: host, Port: port, OSFamily: osFamily}
-	if err := sshInstallAgent(info, serverID); err != nil {
+	// sshInstallAgent now writes the endpoints file during install so the agent
+	// starts with endpoints=1 and immediately connects to the Host WebSocket.
+	if err := sshInstallAgent(info, serverID, hostEndpoint); err != nil {
 		log.Printf("[agent-bootstrap] install failed for %s: %v (SSH-pull still available)", host, err)
 		return
 	}
-	if err := sshAgentAddEndpoint(info, hostEndpoint); err != nil {
-		log.Printf("[agent-bootstrap] add-endpoint failed for %s: %v", host, err)
-	}
+	log.Printf("[agent-bootstrap] agent installed on %s with endpoint %s", host, hostEndpoint)
 }
 
-// Unregister Server API
 // Unregister Server API with Admin Safety & Self-Destruction
 func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
@@ -417,30 +577,58 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 		username = session.Username
 	}
 
-	// Check admin count for this server
-	var adminCount int
-	_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND role = 'admin'", serverID).Scan(&adminCount)
+	// 1. Must be admin to trigger unregister/leave flow
+	allowed, _ := checkServerPermission(serverID, username, "admin")
+	if !allowed {
+		http.Error(w, "Forbidden: Only server admins can unregister or leave a server.", http.StatusForbidden)
+		return
+	}
 
-	var userRole string
-	_ = db.QueryRow("SELECT role FROM server_members WHERE server_id = $1 AND username = $2", serverID, username).Scan(&userRole)
+	// Count other members
+	var otherMembersCount int
+	_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND username != $2", serverID, username).Scan(&otherMembersCount)
 
-	// Rule: If multiple admins exist, unregistering simply revokes the calling admin's access while keeping server online
-	if adminCount > 1 && username != "" {
+	// If leave=true is passed, the user wants to leave the server (revoke their admin access)
+	isLeave := r.URL.Query().Get("leave") == "true"
+	// If force=true is passed, they want to completely delete it even if others are on it
+	isForce := r.URL.Query().Get("force") == "true"
+
+	if isLeave {
+		// Verify there is at least one other admin before letting this admin leave
+		var otherAdminsCount int
+		_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND role = 'admin' AND username != $2", serverID, username).Scan(&otherAdminsCount)
+
+		if otherAdminsCount == 0 && otherMembersCount > 0 {
+			http.Error(w, "Conflict: You are the last remaining admin. You must promote another member to admin before leaving, or delete the server completely.", http.StatusConflict)
+			return
+		}
+
 		_, err := db.Exec("DELETE FROM server_members WHERE server_id = $1 AND username = $2", serverID, username)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to remove membership: %v", err), http.StatusInternalServerError)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":           "membership_revoked",
-			"message":          "You have left the server. It remains active for other admins.",
-			"remaining_admins": adminCount - 1,
+			"status":  "membership_revoked",
+			"message": "You have left the server. It remains active for other members.",
 		})
 		return
 	}
 
-	// Last remaining admin (or owner) unregistering: Purge server and trigger target agent self-destruction
+	// If other members exist and force is not specified, warn the admin
+	if otherMembersCount > 0 && !isForce {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":       "warning_other_members",
+			"message":      fmt.Sprintf("There are %d other members monitoring this server. Unregistering will completely delete it for everyone and uninstall the target agent.", otherMembersCount),
+			"member_count": otherMembersCount,
+		})
+		return
+	}
+
+	// Proceed with full deletion & agent teardown
 	sshInfo, sshErr := loadServerSSHInfo(serverID)
 
 	// Delete associated records
@@ -463,7 +651,7 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Issue self-destruct teardown payload to target agent daemon on port 59191
+	// Issue self-destruct teardown payload to target agent daemon
 	if sshErr == nil && sshInfo.Host != "127.0.0.1" && sshInfo.Host != "localhost" {
 		go func(info serverSSHInfo) {
 			log.Printf("[agent-teardown] Sending self-destruct signal to target agent on %s", info.Host)
@@ -478,6 +666,235 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type MemberInfo struct {
+	Username  string    `json:"username"`
+	Role      string    `json:"role"`
+	Email     string    `json:"email"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func handleServerMembers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	serverID := r.URL.Query().Get("id")
+	if serverID == "" {
+		http.Error(w, "Missing server id", http.StatusBadRequest)
+		return
+	}
+
+	session, err := getSession(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Requester must have at least "viewer" access
+	allowed, currentUserRole := checkServerPermission(serverID, session.Username, "viewer")
+	if !allowed {
+		http.Error(w, "Forbidden: You do not have access to view this server's team members.", http.StatusForbidden)
+		return
+	}
+
+	// Use DISTINCT ON to deduplicate by lowercase username — guards against any case-mismatch rows
+	rows, err := db.Query(`
+		SELECT DISTINCT ON (LOWER(username)) username, role, COALESCE(email, ''), created_at
+		FROM server_members
+		WHERE server_id = $1
+		ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 1 WHEN 'operator' THEN 2 WHEN 'member' THEN 3 ELSE 4 END ASC, created_at ASC
+	`, serverID)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	members := []MemberInfo{}
+	for rows.Next() {
+		var m MemberInfo
+		if err := rows.Scan(&m.Username, &m.Role, &m.Email, &m.CreatedAt); err == nil {
+			members = append(members, m)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"members":           members,
+		"current_user_role": currentUserRole,
+	})
+}
+
+func handleServerInvite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session, err := getSession(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		ServerID string `json:"server_id"`
+		Username string `json:"username"`
+		Role     string `json:"role"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
+	req.Role = strings.ToLower(strings.TrimSpace(req.Role))
+
+	if req.ServerID == "" || req.Username == "" || req.Role == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	if req.Role != "admin" && req.Role != "operator" && req.Role != "viewer" {
+		http.Error(w, "Invalid role. Must be 'admin', 'operator', or 'viewer'", http.StatusBadRequest)
+		return
+	}
+
+	// Requester must have "admin" access
+	allowed, _ := checkServerPermission(req.ServerID, session.Username, "admin")
+	if !allowed {
+		http.Error(w, "Forbidden: Only server admins can invite new members.", http.StatusForbidden)
+		return
+	}
+
+	_, err = db.Exec("INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, $3) ON CONFLICT (server_id, username) DO UPDATE SET role = $3", req.ServerID, req.Username, req.Role)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "User successfully invited."})
+}
+
+func handleServerRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session, err := getSession(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	serverID := r.URL.Query().Get("server_id")
+	targetUser := strings.ToLower(r.URL.Query().Get("username"))
+
+	if serverID == "" || targetUser == "" {
+		http.Error(w, "Missing parameters", http.StatusBadRequest)
+		return
+	}
+
+	// If a member is removing themselves, we allow it (leave server), otherwise caller must be admin
+	if session.Username != targetUser {
+		allowed, _ := checkServerPermission(serverID, session.Username, "admin")
+		if !allowed {
+			http.Error(w, "Forbidden: Only server admins can remove other members.", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Check if this is the last admin
+	var role string
+	err = db.QueryRow("SELECT role FROM server_members WHERE server_id = $1 AND username = $2", serverID, targetUser).Scan(&role)
+	if err == nil && role == "admin" {
+		var adminCount int
+		_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND role = 'admin'", serverID).Scan(&adminCount)
+		if adminCount <= 1 {
+			http.Error(w, "Conflict: Cannot remove the last remaining admin. Please transfer ownership or delete the server.", http.StatusConflict)
+			return
+		}
+	}
+
+	_, err = db.Exec("DELETE FROM server_members WHERE server_id = $1 AND username = $2", serverID, targetUser)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "User successfully removed."})
+}
+
+func handleServerRole(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session, err := getSession(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		ServerID string `json:"server_id"`
+		Username string `json:"username"`
+		Role     string `json:"role"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
+	req.Role = strings.ToLower(strings.TrimSpace(req.Role))
+
+	if req.ServerID == "" || req.Username == "" || req.Role == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	if req.Role != "admin" && req.Role != "operator" && req.Role != "viewer" {
+		http.Error(w, "Invalid role. Must be 'admin', 'operator', or 'viewer'", http.StatusBadRequest)
+		return
+	}
+
+	// Requester must have "admin" access
+	allowed, _ := checkServerPermission(req.ServerID, session.Username, "admin")
+	if !allowed {
+		http.Error(w, "Forbidden: Only server admins can change roles.", http.StatusForbidden)
+		return
+	}
+
+	// If demoting an admin, make sure they are not the last remaining admin
+	var oldRole string
+	err = db.QueryRow("SELECT role FROM server_members WHERE server_id = $1 AND username = $2", req.ServerID, req.Username).Scan(&oldRole)
+	if err == nil && oldRole == "admin" && req.Role != "admin" {
+		var adminCount int
+		_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND role = 'admin'", req.ServerID).Scan(&adminCount)
+		if adminCount <= 1 {
+			http.Error(w, "Conflict: Cannot demote the last remaining admin. Please promote another user to admin first.", http.StatusConflict)
+			return
+		}
+	}
+
+	_, err = db.Exec("UPDATE server_members SET role = $1 WHERE server_id = $2 AND username = $3", req.Role, req.ServerID, req.Username)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "Role successfully updated."})
+}
+
 // 2. Server List API (Sidebar & Main Page Overview)
 func handleGetServers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -485,7 +902,38 @@ func handleGetServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.Query("SELECT id, hostname, ip_address, os_family, status, last_seen, created_at FROM servers ORDER BY hostname ASC")
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	username := strings.ToLower(session.Username)
+
+	// 1. Auto-claim any orphaned servers
+	orphanedRows, err := db.Query("SELECT id FROM servers s WHERE NOT EXISTS (SELECT 1 FROM server_members m WHERE m.server_id = s.id)")
+	if err == nil && orphanedRows != nil {
+		var oIDs []string
+		for orphanedRows.Next() {
+			var oID string
+			if err := orphanedRows.Scan(&oID); err == nil {
+				oIDs = append(oIDs, oID)
+			}
+		}
+		orphanedRows.Close()
+		for _, oID := range oIDs {
+			_, _ = db.Exec("INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, 'admin') ON CONFLICT (server_id, username) DO NOTHING", oID, username)
+		}
+	}
+
+	// 2. Fetch servers that current user is a member/admin of
+	query := `
+		SELECT s.id, s.hostname, s.ip_address, s.os_family, s.status, s.last_seen, s.created_at, m.role
+		FROM servers s
+		JOIN server_members m ON s.id = m.server_id
+		WHERE m.username = $1
+		ORDER BY s.hostname ASC
+	`
+	rows, err := db.Query(query, username)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -495,7 +943,7 @@ func handleGetServers(w http.ResponseWriter, r *http.Request) {
 	servers := []Server{}
 	for rows.Next() {
 		var s Server
-		if err := rows.Scan(&s.ID, &s.Hostname, &s.IPAddress, &s.OSFamily, &s.Status, &s.LastSeen, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Hostname, &s.IPAddress, &s.OSFamily, &s.Status, &s.LastSeen, &s.CreatedAt, &s.Role); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -518,19 +966,43 @@ func handleGetActiveServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	username := strings.ToLower(session.Username)
+
+	// 1. Auto-claim any orphaned servers
+	orphanedRows, err := db.Query("SELECT id FROM servers s WHERE NOT EXISTS (SELECT 1 FROM server_members m WHERE m.server_id = s.id)")
+	if err == nil && orphanedRows != nil {
+		var oIDs []string
+		for orphanedRows.Next() {
+			var oID string
+			if err := orphanedRows.Scan(&oID); err == nil {
+				oIDs = append(oIDs, oID)
+			}
+		}
+		orphanedRows.Close()
+		for _, oID := range oIDs {
+			_, _ = db.Exec("INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, 'admin') ON CONFLICT (server_id, username) DO NOTHING", oID, username)
+		}
+	}
+
 	query := `
-		SELECT s.id, s.hostname, s.ip_address, s.os_family, s.status, s.last_seen, s.created_at
+		SELECT s.id, s.hostname, s.ip_address, s.os_family, s.status, s.last_seen, s.created_at, m.role
 		FROM servers s
+		JOIN server_members m ON s.id = m.server_id
 		LEFT JOIN (
 			SELECT server_id, MAX(viewed_at) as last_viewed
 			FROM recently_viewed
 			GROUP BY server_id
 		) r ON s.id = r.server_id
-		WHERE s.status = 'online' AND s.last_seen >= NOW() - INTERVAL '90 seconds'
+		WHERE m.username = $1 AND s.status = 'online' AND s.last_seen >= NOW() - INTERVAL '90 seconds'
 		ORDER BY COALESCE(r.last_viewed, '1970-01-01'::timestamp) DESC, s.last_seen DESC
 		LIMIT 6`
 
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, username)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -540,7 +1012,7 @@ func handleGetActiveServers(w http.ResponseWriter, r *http.Request) {
 	servers := []Server{}
 	for rows.Next() {
 		var s Server
-		if err := rows.Scan(&s.ID, &s.Hostname, &s.IPAddress, &s.OSFamily, &s.Status, &s.LastSeen, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Hostname, &s.IPAddress, &s.OSFamily, &s.Status, &s.LastSeen, &s.CreatedAt, &s.Role); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -569,6 +1041,12 @@ func handleServerDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var subPath string
 	if len(parts) >= 2 {
 		subPath = parts[1]
@@ -578,13 +1056,31 @@ func handleServerDetail(w http.ResponseWriter, r *http.Request) {
 		subPath = strings.TrimSuffix(subPath, "/")
 	}
 
-	// Route POST handlers before GET check
+	// 1. Enforce Role check for subPath action/POST endpoints (Operator required)
 	if subPath == "docker-run" || subPath == "container-action" {
+		allowed, _ := checkServerPermission(serverID, session.Username, "operator")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to execute container actions on this server.", http.StatusForbidden)
+			return
+		}
 		if subPath == "docker-run" {
 			handleDockerRun(w, r, serverID)
 		} else {
 			handleContainerActionProxy(w, r, serverID)
 		}
+		return
+	}
+
+	// 2. Enforce Role check for all other read/GET endpoints (Viewer required)
+	allowed, _ := checkServerPermission(serverID, session.Username, "viewer")
+	if !allowed {
+		http.Error(w, "Forbidden: You do not have permission to access this server.", http.StatusForbidden)
+		return
+	}
+
+	// Route commands request: /api/servers/detail/:id/commands (supports GET/POST/DELETE)
+	if subPath == "commands" || strings.HasPrefix(subPath, "commands/") {
+		handleServerCommands(w, r, serverID)
 		return
 	}
 
@@ -659,6 +1155,8 @@ func handleServerDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_ = db.QueryRow("SELECT role FROM server_members WHERE server_id = $1 AND LOWER(username) = LOWER($2)", s.ID, session.Username).Scan(&s.Role)
+
 	// Update recently viewed log
 	db.Exec("INSERT INTO recently_viewed (server_id) VALUES ($1)", s.ID)
 
@@ -686,8 +1184,6 @@ func handleServerDetail(w http.ResponseWriter, r *http.Request) {
 
 // Helper to perform HTTP requests to Go Agent with localhost fallback
 // Proxy function to query active processes list from remote server over SSH
-
-
 
 func handleGetProcessesProxy(w http.ResponseWriter, r *http.Request, serverID string) {
 	info, err := loadServerSSHInfo(serverID)
@@ -949,6 +1445,35 @@ func handleDockerRun(w http.ResponseWriter, r *http.Request, serverID string) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "output": "Demo: no real action taken"})
 		return
 	}
+
+	// Try WebSocket first
+	agentReq := struct {
+		Action string `json:"action"`
+		Target string `json:"target"`
+		Dir    string `json:"dir"`
+	}{
+		Action: req.Action,
+		Target: req.Container,
+		Dir:    req.Dir,
+	}
+	agentBody, _ := json.Marshal(agentReq)
+	if agentResp, dErr := doAgentPostRequest(info, "container-action", agentBody); dErr == nil {
+		var agentRes struct {
+			Ok     bool   `json:"ok"`
+			Output string `json:"output"`
+		}
+		if json.Unmarshal(agentResp, &agentRes) == nil {
+			w.Header().Set("Content-Type", "application/json")
+			if agentRes.Ok {
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok", "output": agentRes.Output})
+			} else {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Agent action failed", "output": agentRes.Output})
+			}
+			return
+		}
+	}
+
 	var dockerCmd string
 	switch req.Action {
 	case "logs":
@@ -1089,7 +1614,7 @@ func getLatestDBMetrics(serverID string) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Reconstruct the metrics map structure expected by the frontend
 	return map[string]interface{}{
 		"cpu":           cpu,
@@ -1160,7 +1685,7 @@ func handleGetMetrics(w http.ResponseWriter, r *http.Request, serverID string) {
 			json.NewEncoder(w).Encode(map[string]string{"error": "Metrics unavailable", "detail": fmt.Sprintf("Agent offline and no database history: %v (DB err: %v)", err, dbErr)})
 			return
 		}
-		
+
 		setCachedMetrics(serverID, metrics, 60)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(metrics)
@@ -1180,8 +1705,21 @@ func handleGetMetrics(w http.ResponseWriter, r *http.Request, serverID string) {
 	json.NewEncoder(w).Encode(metrics)
 }
 
-// persistMetricSample writes a metrics snapshot into metrics_history.
+var (
+	lastSampleMu   sync.Mutex
+	lastSampleTime = make(map[string]time.Time)
+)
+
+// persistMetricSample writes a metrics snapshot into metrics_history (throttled to max 1 sample per 5s per server).
 func persistMetricSample(serverID string, m map[string]interface{}) {
+	lastSampleMu.Lock()
+	if t, exists := lastSampleTime[serverID]; exists && time.Since(t) < 5*time.Second {
+		lastSampleMu.Unlock()
+		return
+	}
+	lastSampleTime[serverID] = time.Now()
+	lastSampleMu.Unlock()
+
 	getF := func(k string) float64 {
 		if v, ok := m[k].(float64); ok {
 			return v
@@ -1208,11 +1746,11 @@ func handleTestSSH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p struct {
-		IPAddress  string `json:"ip_address"`
-		SSHUser    string `json:"ssh_user"`
-		SSHKey     string `json:"ssh_key"`
+		IPAddress   string `json:"ip_address"`
+		SSHUser     string `json:"ssh_user"`
+		SSHKey      string `json:"ssh_key"`
 		SSHPassword string `json:"ssh_password"`
-		SSHPort    int    `json:"ssh_port"`
+		SSHPort     int    `json:"ssh_port"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -1271,13 +1809,13 @@ func handleGetHistory(w http.ResponseWriter, r *http.Request, serverID string) {
 	defer rows.Close()
 
 	type point struct {
-		Time         string  `json:"time"`
-		CPU          float64 `json:"cpu"`
-		RAMUsedPct   float64 `json:"ram_used_pct"`
-		SwapUsedPct  float64 `json:"swap_used_pct"`
-		DiskUsedPct  float64 `json:"disk_used_pct"`
-		NetRxKB      float64 `json:"net_rx_kb"`
-		NetTxKB      float64 `json:"net_tx_kb"`
+		Time        string  `json:"time"`
+		CPU         float64 `json:"cpu"`
+		RAMUsedPct  float64 `json:"ram_used_pct"`
+		SwapUsedPct float64 `json:"swap_used_pct"`
+		DiskUsedPct float64 `json:"disk_used_pct"`
+		NetRxKB     float64 `json:"net_rx_kb"`
+		NetTxKB     float64 `json:"net_tx_kb"`
 	}
 	var data []point
 	for rows.Next() {
@@ -1308,6 +1846,18 @@ func handleToggleService(w http.ResponseWriter, r *http.Request) {
 	serverID := parts[4]
 	if !uuidRegex.MatchString(serverID) {
 		http.Error(w, "Invalid UUID", http.StatusBadRequest)
+		return
+	}
+
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	allowed, _ := checkServerPermission(serverID, session.Username, "operator")
+	if !allowed {
+		http.Error(w, "Forbidden: You do not have permission to toggle services on this server.", http.StatusForbidden)
 		return
 	}
 
@@ -1357,6 +1907,18 @@ func handleServiceControl(w http.ResponseWriter, r *http.Request) {
 	serverID := parts[4]
 	if !uuidRegex.MatchString(serverID) {
 		http.Error(w, "Invalid UUID", http.StatusBadRequest)
+		return
+	}
+
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	allowed, _ := checkServerPermission(serverID, session.Username, "operator")
+	if !allowed {
+		http.Error(w, "Forbidden: You do not have permission to execute service controls on this server.", http.StatusForbidden)
 		return
 	}
 
@@ -1418,6 +1980,18 @@ func handleKillProcessControl(w http.ResponseWriter, r *http.Request) {
 	serverID := parts[5]
 	if !uuidRegex.MatchString(serverID) {
 		http.Error(w, "Invalid UUID", http.StatusBadRequest)
+		return
+	}
+
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	allowed, _ := checkServerPermission(serverID, session.Username, "operator")
+	if !allowed {
+		http.Error(w, "Forbidden: You do not have permission to execute process kills on this server.", http.StatusForbidden)
 		return
 	}
 
@@ -1496,6 +2070,18 @@ func handleKillApplicationControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	allowed, _ := checkServerPermission(serverID, session.Username, "operator")
+	if !allowed {
+		http.Error(w, "Forbidden: You do not have permission to execute application kills on this server.", http.StatusForbidden)
+		return
+	}
+
 	var payload struct {
 		Name   string `json:"name"`
 		Signal string `json:"signal"`
@@ -1542,9 +2128,21 @@ func handleKillApplicationControl(w http.ResponseWriter, r *http.Request) {
 
 // 7. Alert Rules Configuration API
 func handleAlertRules(w http.ResponseWriter, r *http.Request) {
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	username := strings.ToLower(strings.TrimSpace(session.Username))
+
 	if r.Method == http.MethodGet {
-		// List active alert rules
-		rows, err := db.Query("SELECT id, server_id, metric_type, operator, threshold, duration_minutes, recipient_email, is_active, is_firing FROM alert_rules")
+		// List active alert rules scoped to servers user is member of
+		query := `
+			SELECT r.id, r.server_id, r.metric_type, r.operator, r.threshold, r.duration_minutes, r.recipient_email, COALESCE(r.recipient_type, 'self'), r.is_active, r.is_firing, r.target_type, r.target_value 
+			FROM alert_rules r
+			JOIN server_members m ON r.server_id = m.server_id
+			WHERE m.username = $1`
+		rows, err := db.Query(query, username)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -1554,7 +2152,7 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 		rules := []AlertRule{}
 		for rows.Next() {
 			var rule AlertRule
-			if err := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.IsActive, &rule.IsFiring); err != nil {
+			if err := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.RecipientType, &rule.IsActive, &rule.IsFiring, &rule.TargetType, &rule.TargetValue); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -1573,13 +2171,42 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session, errSession := getSession(r)
-		if errSession == nil && session.Email != "" {
+		if rule.RecipientType == "" {
+			rule.RecipientType = "self"
+		}
+		if rule.RecipientType == "self" {
 			rule.RecipientEmail = session.Email
+		} else if rule.RecipientType == "all" {
+			rows, err := db.Query("SELECT COALESCE(email, '') FROM server_members WHERE server_id = $1 AND email != ''", rule.ServerID)
+			if err == nil {
+				var emails []string
+				for rows.Next() {
+					var e string
+					rows.Scan(&e)
+					if e != "" {
+						emails = append(emails, e)
+					}
+				}
+				rows.Close()
+				if len(emails) > 0 {
+					rule.RecipientEmail = strings.Join(emails, ",")
+				} else {
+					rule.RecipientEmail = session.Email
+				}
+			} else {
+				rule.RecipientEmail = session.Email
+			}
 		}
 
 		if !uuidRegex.MatchString(rule.ServerID) || rule.MetricType == "" || rule.RecipientEmail == "" {
 			http.Error(w, "Invalid parameters (missing UUID, metric, or user email)", http.StatusBadRequest)
+			return
+		}
+
+		// Enforce Operator permission
+		allowed, _ := checkServerPermission(rule.ServerID, username, "operator")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to manage alert rules on this server.", http.StatusForbidden)
 			return
 		}
 
@@ -1599,9 +2226,9 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 		}
 
 		query := `
-			INSERT INTO alert_rules (server_id, metric_type, operator, threshold, duration_minutes, recipient_email, is_active, is_firing)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)`
-		_, err := db.Exec(query, rule.ServerID, rule.MetricType, rule.Operator, rule.Threshold, rule.DurationMinutes, rule.RecipientEmail, rule.IsActive)
+			INSERT INTO alert_rules (server_id, metric_type, operator, threshold, duration_minutes, recipient_email, recipient_type, is_active, is_firing, target_type, target_value)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10)`
+		_, err := db.Exec(query, rule.ServerID, rule.MetricType, rule.Operator, rule.Threshold, rule.DurationMinutes, rule.RecipientEmail, rule.RecipientType, rule.IsActive, rule.TargetType, rule.TargetValue)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -1618,7 +2245,22 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Missing rule id", http.StatusBadRequest)
 			return
 		}
-		_, err := db.Exec("DELETE FROM alert_rules WHERE id = $1", ruleID)
+
+		// Enforce Operator permission by looking up the server_id of the rule
+		var serverID string
+		err := db.QueryRow("SELECT server_id FROM alert_rules WHERE id = $1", ruleID).Scan(&serverID)
+		if err != nil {
+			http.Error(w, "Rule not found", http.StatusNotFound)
+			return
+		}
+
+		allowed, _ := checkServerPermission(serverID, username, "operator")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to manage alert rules on this server.", http.StatusForbidden)
+			return
+		}
+
+		_, err = db.Exec("DELETE FROM alert_rules WHERE id = $1", ruleID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -1653,9 +2295,54 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session, errSession := getSession(r)
-		if errSession == nil && session.Email != "" {
+		// Enforce Operator permission on the existing server ID of the rule
+		var existingServerID string
+		err = db.QueryRow("SELECT server_id FROM alert_rules WHERE id = $1", ruleID).Scan(&existingServerID)
+		if err != nil {
+			http.Error(w, "Rule not found", http.StatusNotFound)
+			return
+		}
+
+		allowed, _ := checkServerPermission(existingServerID, username, "operator")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to manage alert rules on this server.", http.StatusForbidden)
+			return
+		}
+
+		// Also check permission on new server ID if it's changing
+		if rule.ServerID != existingServerID {
+			allowed, _ = checkServerPermission(rule.ServerID, username, "operator")
+			if !allowed {
+				http.Error(w, "Forbidden: You do not have permission to manage alert rules on the target server.", http.StatusForbidden)
+				return
+			}
+		}
+
+		if rule.RecipientType == "" {
+			rule.RecipientType = "self"
+		}
+		if rule.RecipientType == "self" {
 			rule.RecipientEmail = session.Email
+		} else if rule.RecipientType == "all" {
+			rows, err := db.Query("SELECT COALESCE(email, '') FROM server_members WHERE server_id = $1 AND email != ''", rule.ServerID)
+			if err == nil {
+				var emails []string
+				for rows.Next() {
+					var e string
+					rows.Scan(&e)
+					if e != "" {
+						emails = append(emails, e)
+					}
+				}
+				rows.Close()
+				if len(emails) > 0 {
+					rule.RecipientEmail = strings.Join(emails, ",")
+				} else {
+					rule.RecipientEmail = session.Email
+				}
+			} else {
+				rule.RecipientEmail = session.Email
+			}
 		}
 
 		if !uuidRegex.MatchString(rule.ServerID) || rule.MetricType == "" || rule.RecipientEmail == "" {
@@ -1680,9 +2367,9 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 
 		query := `
 			UPDATE alert_rules
-			SET server_id = $1, metric_type = $2, operator = $3, threshold = $4, duration_minutes = $5, recipient_email = $6, is_active = $7, is_firing = $8
-			WHERE id = $9`
-		_, err = db.Exec(query, rule.ServerID, rule.MetricType, rule.Operator, rule.Threshold, rule.DurationMinutes, rule.RecipientEmail, rule.IsActive, rule.IsFiring, ruleID)
+			SET server_id = $1, metric_type = $2, operator = $3, threshold = $4, duration_minutes = $5, recipient_email = $6, recipient_type = $7, is_active = $8, is_firing = $9, target_type = $10, target_value = $11
+			WHERE id = $12`
+		_, err = db.Exec(query, rule.ServerID, rule.MetricType, rule.Operator, rule.Threshold, rule.DurationMinutes, rule.RecipientEmail, rule.RecipientType, rule.IsActive, rule.IsFiring, rule.TargetType, rule.TargetValue, ruleID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -1696,13 +2383,224 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
+// 7b. Custom Commands handler (dispatched from handleServerDetail)
+func handleServerCommands(w http.ResponseWriter, r *http.Request, serverID string) {
+	session, err := getSession(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	username := strings.ToLower(strings.TrimSpace(session.Username))
+
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/servers/detail/"+serverID+"/commands")
+	trimmed = strings.TrimSuffix(trimmed, "/")
+
+	switch {
+	case trimmed == "" || trimmed == "/":
+		if r.Method == http.MethodGet {
+			allowed, _ := checkServerPermission(serverID, username, "viewer")
+			if !allowed {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			rows, err := db.Query("SELECT id, server_id, service_name, commands, created_by, updated_at FROM custom_commands WHERE server_id = $1 ORDER BY service_name", serverID)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+			sets := []CustomCommandSet{}
+			for rows.Next() {
+				var s CustomCommandSet
+				var cmdsBytes []byte
+				if err := rows.Scan(&s.ID, &s.ServerID, &s.ServiceName, &cmdsBytes, &s.CreatedBy, &s.UpdatedAt); err == nil {
+					json.Unmarshal(cmdsBytes, &s.Commands)
+					sets = append(sets, s)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sets)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			allowed, _ := checkServerPermission(serverID, username, "admin")
+			if !allowed {
+				http.Error(w, "Forbidden: Only admins can manage command sets.", http.StatusForbidden)
+				return
+			}
+			var payload struct {
+				ServiceName string            `json:"service_name"`
+				Commands    map[string]string `json:"commands"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, "Invalid JSON", http.StatusBadRequest)
+				return
+			}
+			if payload.ServiceName == "" || len(payload.Commands) == 0 {
+				http.Error(w, "service_name and commands are required", http.StatusBadRequest)
+				return
+			}
+			cmdsBytes, _ := json.Marshal(payload.Commands)
+			_, err := db.Exec(`
+				INSERT INTO custom_commands (server_id, service_name, commands, created_by, updated_at)
+				VALUES ($1, $2, $3, $4, NOW())
+				ON CONFLICT (server_id, service_name)
+				DO UPDATE SET commands = $3, created_by = $4, updated_at = NOW()
+			`, serverID, payload.ServiceName, cmdsBytes, username)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "saved"})
+			return
+		}
+
+		if r.Method == http.MethodDelete {
+			allowed, _ := checkServerPermission(serverID, username, "admin")
+			if !allowed {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			name := r.URL.Query().Get("name")
+			if name == "" {
+				http.Error(w, "Missing name parameter", http.StatusBadRequest)
+				return
+			}
+			_, err := db.Exec("DELETE FROM custom_commands WHERE server_id = $1 AND service_name = $2", serverID, name)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+			return
+		}
+
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+
+	case trimmed == "/execute":
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		allowed, _ := checkServerPermission(serverID, username, "operator")
+		if !allowed {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		var payload struct {
+			ServiceName string `json:"service_name"`
+			CommandType string `json:"command_type"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if payload.ServiceName == "" || payload.CommandType == "" {
+			http.Error(w, "service_name and command_type are required", http.StatusBadRequest)
+			return
+		}
+
+		var cmdsBytes []byte
+		err := db.QueryRow("SELECT commands FROM custom_commands WHERE server_id = $1 AND service_name = $2", serverID, payload.ServiceName).Scan(&cmdsBytes)
+		if err != nil {
+			http.Error(w, "Command set not found", http.StatusNotFound)
+			return
+		}
+		var commands map[string]string
+		json.Unmarshal(cmdsBytes, &commands)
+		command, ok := commands[payload.CommandType]
+		if !ok {
+			http.Error(w, fmt.Sprintf("Command type '%s' not found in set '%s'", payload.CommandType, payload.ServiceName), http.StatusNotFound)
+			return
+		}
+
+		info, err := loadServerSSHInfo(serverID)
+		var output string
+		var status string
+		startTime := time.Now()
+		if err != nil {
+			status = "failed"
+			output = err.Error()
+		} else if isDemoServer(info, serverID) {
+			status = "success"
+			output = fmt.Sprintf("Demo execution: %s %s => %s", payload.ServiceName, payload.CommandType, command)
+		} else {
+			out, execErr := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, command)
+			if execErr != nil {
+				status = "failed"
+				// out already contains the command's output (stderr + stdout);
+				// execErr.Error() is the same content, so just show out directly.
+				if strings.TrimSpace(out) != "" {
+					output = out
+				} else {
+					output = execErr.Error()
+				}
+			} else {
+				status = "success"
+				output = out
+			}
+		}
+		durationMs := int(time.Since(startTime).Milliseconds())
+
+		_, _ = db.Exec(`
+			INSERT INTO command_execution_log (server_id, service_name, command_type, command, executed_by, status, output, duration_ms)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, serverID, payload.ServiceName, payload.CommandType, command, username, status, output, durationMs)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":      status,
+			"output":      output,
+			"duration_ms": durationMs,
+		})
+
+	case trimmed == "/logs":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		allowed, _ := checkServerPermission(serverID, username, "viewer")
+		if !allowed {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		rows, err := db.Query(`
+			SELECT id, server_id, service_name, command_type, command, executed_by, executed_at, status, COALESCE(output, ''), COALESCE(duration_ms, 0)
+			FROM command_execution_log
+			WHERE server_id = $1
+			ORDER BY executed_at DESC
+			LIMIT 100
+		`, serverID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		logs := []CommandExecutionLog{}
+		for rows.Next() {
+			var l CommandExecutionLog
+			if err := rows.Scan(&l.ID, &l.ServerID, &l.ServiceName, &l.CommandType, &l.Command, &l.ExecutedBy, &l.ExecutedAt, &l.Status, &l.Output, &l.DurationMs); err == nil {
+				logs = append(logs, l)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(logs)
+
+	default:
+		http.Error(w, "Unknown command sub-path", http.StatusNotFound)
+	}
+}
+
 // 8. Alerting engine loop
 // Periodically evaluates user alert thresholds
 func startAlertingLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	go func() {
 		for range ticker.C {
-			rows, err := db.Query("SELECT id, server_id, metric_type, operator, threshold, duration_minutes, recipient_email, last_triggered, is_firing FROM alert_rules WHERE is_active = TRUE")
+			rows, err := db.Query("SELECT id, server_id, metric_type, operator, threshold, duration_minutes, recipient_email, last_triggered, is_firing, target_type, target_value FROM alert_rules WHERE is_active = TRUE")
 			if err != nil {
 				log.Printf("[AlertEngine] Error querying rules: %v", err)
 				continue
@@ -1711,7 +2609,7 @@ func startAlertingLoop() {
 			var rules []AlertRule
 			for rows.Next() {
 				var rule AlertRule
-				if scanErr := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.LastTriggered, &rule.IsFiring); scanErr == nil {
+				if scanErr := rows.Scan(&rule.ID, &rule.ServerID, &rule.MetricType, &rule.Operator, &rule.Threshold, &rule.DurationMinutes, &rule.RecipientEmail, &rule.LastTriggered, &rule.IsFiring, &rule.TargetType, &rule.TargetValue); scanErr == nil {
 					rules = append(rules, rule)
 				}
 			}
@@ -1730,6 +2628,53 @@ func startAlertingLoop() {
 	}()
 }
 
+// 8.1 Metrics pruning loop
+// Deletes metrics_history data older than 7 days
+func startMetricsPruningLoop() {
+	ticker := time.NewTicker(1 * time.Hour)
+	go func() {
+		// Run once on startup
+		pruneOldMetrics()
+		for range ticker.C {
+			pruneOldMetrics()
+		}
+	}()
+}
+
+func pruneOldMetrics() {
+	res, err := db.Exec("DELETE FROM metrics_history WHERE sampled_at < NOW() - INTERVAL '7 days'")
+	if err != nil {
+		log.Printf("[cleanup] failed to prune metrics_history: %v", err)
+	} else {
+		rows, _ := res.RowsAffected()
+		if rows > 0 {
+			log.Printf("[cleanup] successfully pruned %d records older than 7 days from metrics_history", rows)
+		}
+	}
+}
+
+
+func convertToFloat(val interface{}) float64 {
+	if val == nil {
+		return 0
+	}
+	switch v := val.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case string:
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
 func evaluateAlertRule(rule AlertRule) {
 	// Fetch target server SSH credentials
 	info, err := loadServerSSHInfo(rule.ServerID)
@@ -1741,102 +2686,149 @@ func evaluateAlertRule(rule AlertRule) {
 
 	var val float64
 	var found bool = false
+	var triggered bool = false
 
-	if isDemoServer(info, rule.ServerID) {
-		// Mock values for the demo server
-		found = true
-		if rule.MetricType == "cpu" || rule.MetricType == "ram" || rule.MetricType == "disk" {
-			val = rule.Threshold * 0.5 // Keep it benign usually
+	if rule.TargetType == "process" || rule.TargetType == "application" {
+		var processes []map[string]interface{}
+		if isDemoServer(info, rule.ServerID) {
+			processes = []map[string]interface{}{
+				{"pid": "1", "name": "systemd", "user": "root", "cpu": 0.1, "mem": 12.4, "rss": 12.4},
+				{"pid": "824", "name": "alloy", "user": "alloy", "cpu": 1.2, "mem": 64.8, "rss": 64.8},
+				{"pid": "912", "name": "cluster-agent", "user": "root", "cpu": 0.5, "mem": 18.2, "rss": 18.2},
+				{"pid": "1042", "name": "postgres", "user": "postgres", "cpu": 85.2, "mem": 142.1, "rss": 142.1},
+				{"pid": "1205", "name": "nginx", "user": "nginx", "cpu": 0.2, "mem": 8.5, "rss": 8.5},
+				{"pid": "1530", "name": "go-backend", "user": "root", "cpu": 2.4, "mem": 32.0, "rss": 32.0},
+				{"pid": "2054", "name": "node_exporter", "user": "prometheus", "cpu": 0.4, "mem": 14.1, "rss": 14.1},
+				{"pid": "2100", "name": "loki", "user": "loki", "cpu": 1.5, "mem": 98.3, "rss": 98.3},
+			}
 		} else {
-			val = rule.Threshold * 1.2 // Trigger for custom metric demo
+			procsJSON, err := globalRedis.Get("processes:" + rule.ServerID)
+			if err == nil && procsJSON != "" {
+				_ = json.Unmarshal([]byte(procsJSON), &processes)
+			}
+			if len(processes) == 0 {
+				procs, err := sshGetProcesses(info)
+				if err == nil {
+					processes = procs
+					setCachedJSON("processes:"+rule.ServerID, procs, 60)
+				}
+			}
+		}
+
+		var sumCPU float64
+		var sumRAM float64
+		var instances int
+
+		for _, proc := range processes {
+			procName, _ := proc["name"].(string)
+			if strings.ToLower(procName) == strings.ToLower(rule.TargetValue) {
+				instances++
+				if cpuVal, ok := proc["cpu"]; ok {
+					sumCPU += convertToFloat(cpuVal)
+				}
+				if memVal, ok := proc["rss"]; ok {
+					sumRAM += convertToFloat(memVal)
+				} else if memVal, ok := proc["mem"]; ok {
+					sumRAM += convertToFloat(memVal)
+				}
+			}
+		}
+
+		if rule.MetricType == "process_down" {
+			found = true
+			val = float64(instances)
+			triggered = (instances == 0)
+		} else {
+			found = instances > 0
+			if rule.MetricType == "cpu" {
+				val = sumCPU
+			} else if rule.MetricType == "ram" {
+				val = sumRAM
+			}
 		}
 	} else {
-		metrics, mErr := sshGetMetrics(info)
-		if mErr != nil {
-			log.Printf("[AlertEngine] Error gathering metrics over SSH for %s: %v", info.Host, mErr)
-			return
-		}
+		// Server scope
+		if isDemoServer(info, rule.ServerID) {
+			found = true
+			if rule.MetricType == "cpu" || rule.MetricType == "ram" || rule.MetricType == "disk" {
+				val = rule.Threshold * 0.5
+			} else {
+				val = rule.Threshold * 1.2
+			}
+		} else {
+			metrics, ok := getCachedMetrics(rule.ServerID)
+			if !ok {
+				var mErr error
+				metrics, mErr = sshGetMetrics(info)
+				if mErr != nil {
+					log.Printf("[AlertEngine] Error gathering metrics over SSH for %s: %v", info.Host, mErr)
+					return
+				}
+			}
 
-		switch rule.MetricType {
-		case "cpu":
-			if v, ok := metrics["cpu"].(float64); ok {
-				val = v
-				found = true
-			}
-		case "ram":
-			if v, ok := metrics["ram_used_pct"].(float64); ok {
-				val = v
-				found = true
-			}
-		case "disk":
-			if v, ok := metrics["disk_used_pct"].(float64); ok {
-				val = v
-				found = true
-			}
-		default:
-			// Custom metric lookup
-			if valRaw, exists := metrics[rule.MetricType]; exists {
-				switch typedVal := valRaw.(type) {
-				case float64:
-					val = typedVal
+			switch rule.MetricType {
+			case "cpu":
+				if v, ok := metrics["cpu"].(float64); ok {
+					val = v
 					found = true
-				case int:
-					val = float64(typedVal)
+				}
+			case "ram":
+				if v, ok := metrics["ram_used_pct"].(float64); ok {
+					val = v
 					found = true
-				case int64:
-					val = float64(typedVal)
+				}
+			case "disk":
+				if v, ok := metrics["disk_used_pct"].(float64); ok {
+					val = v
 					found = true
-				case string:
-					if parsed, pErr := strconv.ParseFloat(typedVal, 64); pErr == nil {
-						val = parsed
-						found = true
-					}
+				}
+			default:
+				if valRaw, exists := metrics[rule.MetricType]; exists {
+					val = convertToFloat(valRaw)
+					found = true
 				}
 			}
 		}
 	}
 
 	if !found {
-		// If metric is not found, skip evaluation to avoid false alarms
 		return
 	}
 
-	// Check condition based on comparison operators
-	triggered := false
-	switch rule.Operator {
-	case ">":
-		triggered = val > rule.Threshold
-	case "<":
-		triggered = val < rule.Threshold
-	case ">=":
-		triggered = val >= rule.Threshold
-	case "<=":
-		triggered = val <= rule.Threshold
-	case "==":
-		triggered = val == rule.Threshold
-	case "!=":
-		triggered = val != rule.Threshold
-	default:
-		triggered = val > rule.Threshold
+	if rule.MetricType != "process_down" {
+		switch rule.Operator {
+		case ">":
+			triggered = val > rule.Threshold
+		case "<":
+			triggered = val < rule.Threshold
+		case ">=":
+			triggered = val >= rule.Threshold
+		case "<=":
+			triggered = val <= rule.Threshold
+		case "==":
+			triggered = val == rule.Threshold
+		case "!=":
+			triggered = val != rule.Threshold
+		default:
+			triggered = val > rule.Threshold
+		}
 	}
 
 	if triggered {
 		if !rule.IsFiring {
-			log.Printf("[ALERT TRIGGERED] Server %s (%s) crossed %s threshold: current=%.2f, limit=%s %.2f",
-				hostname, ipAddress, rule.MetricType, val, rule.Operator, rule.Threshold)
+			log.Printf("[ALERT TRIGGERED] Server %s (%s) crossed %s threshold: current=%.2f",
+				hostname, ipAddress, rule.MetricType, val)
 
 			sendAlertEmail(rule, hostname, ipAddress, val, false)
 
-			// Update state to firing
 			_, err = db.Exec("UPDATE alert_rules SET is_firing = TRUE, last_triggered = NOW() WHERE id = $1", rule.ID)
 			if err != nil {
 				log.Printf("[AlertEngine] Error setting rule %d to firing: %v", rule.ID, err)
 			}
 		} else {
-			// Already firing, check 15m cooldown to avoid spamming
 			if !rule.LastTriggered.Valid || time.Since(rule.LastTriggered.Time) >= 15*time.Minute {
-				log.Printf("[ALERT RE-TRIGGERED] Server %s (%s) remains in firing state: current=%.2f, limit=%s %.2f",
-					hostname, ipAddress, rule.MetricType, val, rule.Operator, rule.Threshold)
+				log.Printf("[ALERT RE-TRIGGERED] Server %s (%s) %s threshold remains in firing state: current=%.2f",
+					hostname, ipAddress, rule.MetricType, val)
 
 				sendAlertEmail(rule, hostname, ipAddress, val, false)
 				_, _ = db.Exec("UPDATE alert_rules SET last_triggered = NOW() WHERE id = $1", rule.ID)
@@ -1844,12 +2836,11 @@ func evaluateAlertRule(rule AlertRule) {
 		}
 	} else {
 		if rule.IsFiring {
-			log.Printf("[ALERT RESOLVED] Server %s (%s) condition normal: current=%.2f, limit=%s %.2f",
-				hostname, ipAddress, rule.MetricType, val, rule.Operator, rule.Threshold)
+			log.Printf("[ALERT RESOLVED] Server %s (%s) %s threshold condition normal: current=%.2f",
+				hostname, ipAddress, rule.MetricType, val)
 
 			sendAlertEmail(rule, hostname, ipAddress, val, true)
 
-			// Reset firing state
 			_, err = db.Exec("UPDATE alert_rules SET is_firing = FALSE, last_triggered = NULL WHERE id = $1", rule.ID)
 			if err != nil {
 				log.Printf("[AlertEngine] Error clearing firing state for rule %d: %v", rule.ID, err)
@@ -1859,11 +2850,18 @@ func evaluateAlertRule(rule AlertRule) {
 }
 
 func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue float64, isResolved bool) {
-	recipient := strings.TrimSpace(rule.RecipientEmail)
-	if recipient == "" {
-		log.Printf("[AlertEngine] No recipient email configured for rule %s", rule.ID)
+	rawRecipient := strings.TrimSpace(rule.RecipientEmail)
+	if rawRecipient == "" {
+		log.Printf("[AlertEngine] No recipient email configured for rule %d", rule.ID)
 		return
 	}
+
+	recipients := strings.Split(rawRecipient, ",")
+	for i := range recipients {
+		recipients[i] = strings.TrimSpace(recipients[i])
+	}
+	recipientList := strings.Join(recipients, ", ")
+	_ = recipientList
 
 	rawHost := os.Getenv("SMTP_HOST")
 	smtpPort := os.Getenv("SMTP_PORT")
@@ -1905,25 +2903,61 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 	var alertHeader string
 	var alertDetails string
 
+	metricStr := strings.ToUpper(rule.MetricType)
+	if rule.MetricType == "process_down" {
+		metricStr = "OFFLINE STATUS"
+	}
+
+	scopeLabel := "Server"
+	if rule.TargetType == "process" {
+		scopeLabel = fmt.Sprintf("Process %s", rule.TargetValue)
+	} else if rule.TargetType == "application" {
+		scopeLabel = fmt.Sprintf("Application %s", rule.TargetValue)
+	}
+
 	if isResolved {
-		subject = fmt.Sprintf("RESOLVED: %s on %s (%s)", strings.ToUpper(rule.MetricType), hostname, ipAddress)
+		subject = fmt.Sprintf("RESOLVED: %s on %s (%s)", metricStr, hostname, ipAddress)
 		alertHeader = "<h2 style='color:#10b981;'>✅ Cluster Monitor Alert Resolved</h2>"
+
+		var condText string
+		if rule.MetricType == "process_down" {
+			condText = fmt.Sprintf("NORMAL (%s is running)", scopeLabel)
+		} else {
+			unit := "%"
+			if rule.MetricType == "ram" && rule.TargetType != "server" {
+				unit = "MB"
+			}
+			condText = fmt.Sprintf("NORMAL (Current value <strong>%.2f%s</strong> is no longer %s <strong>%.2f%s</strong>)", currentValue, unit, rule.Operator, rule.Threshold, unit)
+		}
+
 		alertDetails = fmt.Sprintf(
 			"<p><strong>Server:</strong> %s (%s)</p>"+
-				"<p><strong>Metric:</strong> %s</p>"+
-				"<p><strong>Status:</strong> NORMAL (Current value <strong>%.2f</strong> is no longer %s <strong>%.2f</strong>)</p>"+
+				"<p><strong>Scope / Target:</strong> %s</p>"+
+				"<p><strong>Status:</strong> %s</p>"+
 				"<p><strong>Resolved At:</strong> %s</p>",
-			hostname, ipAddress, strings.ToUpper(rule.MetricType), currentValue, rule.Operator, rule.Threshold, time.Now().Format(time.RFC1123),
+			hostname, ipAddress, scopeLabel, condText, time.Now().Format(time.RFC1123),
 		)
 	} else {
-		subject = fmt.Sprintf("CRITICAL ALERT: %s on %s (%s)", strings.ToUpper(rule.MetricType), hostname, ipAddress)
+		subject = fmt.Sprintf("CRITICAL ALERT: %s on %s (%s)", metricStr, hostname, ipAddress)
 		alertHeader = "<h2 style='color:#ef4444;'>🚨 Cluster Monitor Alert Triggered</h2>"
+
+		var condText string
+		if rule.MetricType == "process_down" {
+			condText = fmt.Sprintf("Offline (instances == 0)")
+		} else {
+			unit := "%"
+			if rule.MetricType == "ram" && rule.TargetType != "server" {
+				unit = "MB"
+			}
+			condText = fmt.Sprintf("Current value <strong>%.2f%s</strong> crossed threshold of <strong>%s %.2f%s</strong>", currentValue, unit, rule.Operator, rule.Threshold, unit)
+		}
+
 		alertDetails = fmt.Sprintf(
 			"<p><strong>Server:</strong> %s (%s)</p>"+
-				"<p><strong>Metric:</strong> %s</p>"+
-				"<p><strong>Condition:</strong> Current value <strong>%.2f</strong> crossed threshold of <strong>%s %.2f</strong></p>"+
+				"<p><strong>Scope / Target:</strong> %s</p>"+
+				"<p><strong>Condition:</strong> %s</p>"+
 				"<p><strong>Triggered At:</strong> %s</p>",
-			hostname, ipAddress, strings.ToUpper(rule.MetricType), currentValue, rule.Operator, rule.Threshold, time.Now().Format(time.RFC1123),
+			hostname, ipAddress, scopeLabel, condText, time.Now().Format(time.RFC1123),
 		)
 	}
 
@@ -1936,13 +2970,13 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 			"%s"+
 			"%s"+
 			"<hr><p style='font-size:12px; color:#888;'>This is an automated alert from Cluster Monitor.</p>",
-		fromName, fromEmail, recipient, subject, alertHeader, alertDetails,
+		fromName, fromEmail, recipientList, subject, alertHeader, alertDetails,
 	)
 
-	log.Printf("[ALERT EMAIL] Preparing alert email for %s (%s crossed %.2f%%)", recipient, hostname, rule.MetricType, currentValue)
+	log.Printf("[ALERT EMAIL] Preparing alert email for %s (%s %s crossed %.2f)", recipientList, hostname, rule.MetricType, currentValue)
 
 	if smtpHost == "" {
-		log.Printf("[EMAIL SIMULATOR] (Configure SMTP_HOST, SMTP_USER, SMTP_PASSWORD to send live emails) -> TO: %s | SUBJECT: %s", recipient, subject)
+		log.Printf("[EMAIL SIMULATOR] (Configure SMTP_HOST, SMTP_USER, SMTP_PASSWORD to send live emails) -> TO: %s | SUBJECT: %s", recipientList, subject)
 		return
 	}
 
@@ -1968,7 +3002,15 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 					sendErr = fmt.Errorf("SMTP auth failed: %w", err)
 				} else {
 					if err = client.Mail(fromEmail); err == nil {
-						if err = client.Rcpt(recipient); err == nil {
+						allRcptOK := true
+						for _, rcpt := range recipients {
+							if err = client.Rcpt(rcpt); err != nil {
+								sendErr = fmt.Errorf("Rcpt failed for %s: %w", rcpt, err)
+								allRcptOK = false
+								break
+							}
+						}
+						if allRcptOK {
 							w, err := client.Data()
 							if err == nil {
 								_, err = w.Write([]byte(body))
@@ -1981,8 +3023,6 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 							} else {
 								sendErr = err
 							}
-						} else {
-							sendErr = err
 						}
 					} else {
 						sendErr = err
@@ -1992,13 +3032,13 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 		}
 	} else {
 		// STARTTLS for Port 587 / 25
-		sendErr = smtp.SendMail(addr, auth, fromEmail, []string{recipient}, []byte(body))
+		sendErr = smtp.SendMail(addr, auth, fromEmail, recipients, []byte(body))
 	}
 
 	if sendErr != nil {
-		log.Printf("[AlertEngine] Failed to send email to %s via %s: %v", recipient, addr, sendErr)
+		log.Printf("[AlertEngine] Failed to send email to %s via %s: %v", recipientList, addr, sendErr)
 	} else {
-		log.Printf("[AlertEngine] Successfully sent alert email to %s via SMTP (%s)", recipient, smtpHost)
+		log.Printf("[AlertEngine] Successfully sent alert email to %s via SMTP (%s)", recipientList, smtpHost)
 	}
 }
 
@@ -2006,10 +3046,22 @@ func sendAlertEmail(rule AlertRule, hostname, ipAddress string, currentValue flo
 func handleMonitoredProcesses(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	if r.Method == http.MethodGet {
 		serverID := r.URL.Query().Get("server_id")
 		if serverID == "" {
 			http.Error(w, "server_id parameter required", http.StatusBadRequest)
+			return
+		}
+
+		allowed, _ := checkServerPermission(serverID, session.Username, "viewer")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to view monitored processes on this server.", http.StatusForbidden)
 			return
 		}
 
@@ -2046,6 +3098,12 @@ func handleMonitoredProcesses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		allowed, _ := checkServerPermission(payload.ServerID, session.Username, "operator")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to manage monitored processes on this server.", http.StatusForbidden)
+			return
+		}
+
 		// Clear existing monitored processes for this server
 		_, err := db.Exec("DELETE FROM monitored_processes WHERE server_id = $1", payload.ServerID)
 		if err != nil {
@@ -2074,10 +3132,22 @@ func handleMonitoredProcesses(w http.ResponseWriter, r *http.Request) {
 func handleMonitoredApplications(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	if r.Method == http.MethodGet {
 		serverID := r.URL.Query().Get("server_id")
 		if serverID == "" {
 			http.Error(w, "server_id parameter required", http.StatusBadRequest)
+			return
+		}
+
+		allowed, _ := checkServerPermission(serverID, session.Username, "viewer")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to view monitored applications on this server.", http.StatusForbidden)
 			return
 		}
 
@@ -2107,6 +3177,12 @@ func handleMonitoredApplications(w http.ResponseWriter, r *http.Request) {
 
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		allowed, _ := checkServerPermission(payload.ServerID, session.Username, "operator")
+		if !allowed {
+			http.Error(w, "Forbidden: You do not have permission to manage monitored applications on this server.", http.StatusForbidden)
 			return
 		}
 
@@ -2203,17 +3279,7 @@ func handleAgentIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.Exec(`INSERT INTO metrics_history
-		(server_id, cpu, ram_used_pct, ram_used_gb, ram_total_gb, swap_used_pct, swap_used_gb, swap_total_gb, disk_used_pct, disk_used_gb, disk_total_gb, net_rx_kb, net_tx_kb)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-		serverID, m.CPU, m.RAMUsedPct, m.RAMUsedGB, m.RAMTotalGB, m.SwapUsedPct, m.SwapUsedGB, m.SwapTotalGB,
-		m.DiskUsedPct, m.DiskUsedGB, m.DiskTotalGB, m.NetRxKB, m.NetTxKB)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	setCachedMetrics(serverID, map[string]interface{}{
+	metricsMap := map[string]interface{}{
 		"cpu":           m.CPU,
 		"ram_used_pct":  m.RAMUsedPct,
 		"ram_used_gb":   m.RAMUsedGB,
@@ -2226,7 +3292,11 @@ func handleAgentIngest(w http.ResponseWriter, r *http.Request) {
 		"disk_total_gb": m.DiskTotalGB,
 		"net_rx_kb":     m.NetRxKB,
 		"net_tx_kb":     m.NetTxKB,
-	}, 3)
+	}
+
+	setCachedMetrics(serverID, metricsMap, 60)
+	persistMetricSample(serverID, metricsMap)
+	_, _ = db.Exec("UPDATE servers SET status = 'online', last_seen = NOW() WHERE id = $1", serverID)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"stored"}`))
@@ -2479,9 +3549,12 @@ func main() {
 	}
 
 	startAlertingLoop()
+	startMetricsPruningLoop()
 
 	// API Routing
-	http.HandleFunc("/api/register", handleRegister) // Public for agents
+	http.HandleFunc("/api/ws", handleAgentWS)                            // Persistent agent WebSocket handler
+	http.HandleFunc("/api/agent/self-register", handleAgentSelfRegister) // Agent-initiated self-registration (no auth/SSH needed)
+	http.HandleFunc("/api/register", handleRegister)                     // Public for agents
 	http.HandleFunc("/api/servers", authMiddleware(handleGetServers))
 	http.HandleFunc("/api/servers/active", authMiddleware(handleGetActiveServers))
 	http.HandleFunc("/api/servers/unregister", authMiddleware(handleUnregisterServer))
@@ -2495,11 +3568,15 @@ func main() {
 	http.HandleFunc("/api/monitored/applications", authMiddleware(handleMonitoredApplications))
 	http.HandleFunc("/api/ingest/", handleAgentIngest) // Public for agents
 	http.HandleFunc("/api/servers/test-ssh", authMiddleware(handleTestSSH))
+	http.HandleFunc("/api/servers/members", authMiddleware(handleServerMembers))
+	http.HandleFunc("/api/servers/members/invite", authMiddleware(handleServerInvite))
+	http.HandleFunc("/api/servers/members/remove", authMiddleware(handleServerRemove))
+	http.HandleFunc("/api/servers/members/role", authMiddleware(handleServerRole))
 	http.HandleFunc("/api/stream/metrics", authMiddleware(handleStreamMetrics))
 
 	// Auth Endpoints
 	http.HandleFunc("/api/auth/login", handleAuthLogin)
-	http.HandleFunc("/api/auth/github/callback", handleAuthCallback)
+	http.HandleFunc("/api/auth//callback", handleAuthCallback)
 	http.HandleFunc("/api/auth/logout", handleAuthLogout)
 	http.HandleFunc("/api/auth/user", handleAuthUser)
 
@@ -2536,6 +3613,37 @@ func getSession(r *http.Request) (*UserSession, error) {
 	return &session, nil
 }
 
+func roleSatisfies(role, required string) bool {
+	if role == "admin" {
+		return true
+	}
+	if role == "operator" || role == "member" {
+		return required == "operator" || required == "member" || required == "viewer"
+	}
+	if role == "viewer" {
+		return required == "viewer"
+	}
+	return false
+}
+
+func checkServerPermission(serverID string, username string, requiredRole string) (bool, string) {
+	username = strings.ToLower(strings.TrimSpace(username))
+	var count int
+	_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1", serverID).Scan(&count)
+	if count == 0 {
+		_, _ = db.Exec("INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, 'admin') ON CONFLICT (server_id, username) DO NOTHING", serverID, username)
+		return true, "admin"
+	}
+
+	var role string
+	err := db.QueryRow("SELECT role FROM server_members WHERE server_id = $1 AND LOWER(username) = $2", serverID, username).Scan(&role)
+	if err != nil {
+		return false, ""
+	}
+
+	return roleSatisfies(role, requiredRole), role
+}
+
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -2555,19 +3663,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// Check session
 		_, err := getSession(r)
 		if err != nil {
-			// For API endpoints, return 401 Unauthorized
-			if strings.HasPrefix(path, "/api/") {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-			// For static index.html or other document views, redirect to login page
-			http.Redirect(w, r, "/static/login.html", http.StatusTemporaryRedirect)
-			return
-		}
-
-		// Prevent direct access to index.html to bypass root redirection
-		if path == "/static/index.html" {
-			http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -2581,17 +3677,26 @@ func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		log.Println("[auth] Warning: GITHUB_CLIENT_ID is not configured.")
 	}
 
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
+	var redirectURI string
+	if envRedirect := os.Getenv("GITHUB_REDIRECT_URI"); envRedirect != "" {
+		redirectURI = envRedirect
+	} else if hostEP := os.Getenv("HOST_ENDPOINT"); hostEP != "" {
+		redirectURI = strings.TrimRight(hostEP, "/") + "/api/auth/github/callback"
+	} else {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		}
+		redirectURI = fmt.Sprintf("%s://%s/api/auth/github/callback", scheme, r.Host)
 	}
 
-	// Dynamically build redirect URI from browser request host (e.g. localhost:8082 or 192.168.x.x:8082)
-	redirectURI := fmt.Sprintf("%s://%s/api/auth/github/callback", scheme, r.Host)
 	authURL := fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=user:email", clientID, redirectURI)
+	if prompt := r.URL.Query().Get("prompt"); prompt != "" {
+		authURL += fmt.Sprintf("&prompt=%s", url.QueryEscape(prompt))
+	}
 	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
 }
 
@@ -2712,10 +3817,15 @@ func handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		primaryEmail = fmt.Sprintf("%s@users.noreply.github.com", githubUser.Login)
 	}
 
+	// 3.5 Sync email to server_members table
+	if primaryEmail != "" {
+		_, _ = db.Exec("UPDATE server_members SET email = $1 WHERE username = $2", primaryEmail, strings.ToLower(githubUser.Login))
+	}
+
 	// 4. Save session in Redis (expires in 24 hours)
 	sessionID := uuid.New().String()
 	sessionData := UserSession{
-		Username: githubUser.Login,
+		Username: strings.ToLower(githubUser.Login),
 		Email:    primaryEmail,
 	}
 	sessionBytes, err := json.Marshal(sessionData)

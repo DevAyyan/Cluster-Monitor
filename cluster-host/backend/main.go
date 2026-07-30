@@ -3576,7 +3576,7 @@ func main() {
 
 	// Auth Endpoints
 	http.HandleFunc("/api/auth/login", handleAuthLogin)
-	http.HandleFunc("/api/auth//callback", handleAuthCallback)
+	http.HandleFunc("/api/auth/github/callback", handleAuthCallback)
 	http.HandleFunc("/api/auth/logout", handleAuthLogout)
 	http.HandleFunc("/api/auth/user", handleAuthUser)
 

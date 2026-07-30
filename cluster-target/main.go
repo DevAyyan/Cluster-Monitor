@@ -80,6 +80,7 @@ func main() {
 
 	log.Printf("[cluster-target] starting client agent (serverID=%s, endpoints=%d)", serverID, len(endpoints))
 	go logMonitorLoop()
+	go pushLoop()
 
 	for _, ep := range endpoints {
 		go startAgentWSLoop(ep)

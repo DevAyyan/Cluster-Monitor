@@ -158,4 +158,3 @@ func publishMetricStream(serverID string, metrics map[string]interface{}) {
 	_ = globalRedis.Publish("metrics_stream_global", string(b))
 	_ = globalRedis.Publish("metrics_stream:"+serverID, string(b))
 }
-

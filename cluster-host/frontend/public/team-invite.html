@@ -1,0 +1,1648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Server Invite & Fine-Grained Permissions Prototype</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        :root {
+            --bg-darker: #080b12;
+            --bg-dark: #0d121c;
+            --bg-card: #111622;
+            --bg-card-hover: #141b29;
+            --border-color: #1e2738;
+            --border-soft: #182030;
+            --text-primary: #e7edf7;
+            --text-secondary: #8a97b3;
+            --text-faint: #5b6785;
+            --primary: #38bdf8;
+            --primary-glow: rgba(56, 189, 248, 0.15);
+            --primary-hover: #70cbf9;
+            --success: #10b981;
+            --success-glow: rgba(16, 185, 129, 0.15);
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --danger-glow: rgba(239, 68, 68, 0.15);
+            --font-outfit: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            --font-inter: 'Inter', -apple-system, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: var(--font-inter);
+            background-color: var(--bg-darker);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            padding: 40px 20px;
+            overflow-y: auto;
+            position: relative;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(56, 189, 248, 0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(56, 189, 248, 0.02) 1px, transparent 1px);
+            background-size: 40px 40px;
+            pointer-events: none;
+            z-index: 0;
+            mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black 20%, transparent 80%);
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1150px;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: 1.25fr 0.75fr;
+            gap: 25px;
+            margin-top: 20px;
+        }
+
+        @media (max-width: 950px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        header {
+            width: 100%;
+            max-width: 1150px;
+            text-align: left;
+            margin-bottom: 10px;
+            z-index: 1;
+        }
+
+        header h1 {
+            font-family: var(--font-outfit);
+            font-weight: 700;
+            font-size: 28px;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        header h1 i {
+            color: var(--primary);
+            text-shadow: 0 0 10px var(--primary-glow);
+        }
+
+        header p {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-top: 5px;
+        }
+
+        /* CARD STYLING */
+        .card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--primary), var(--success));
+        }
+
+        .card-title {
+            font-family: var(--font-outfit);
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        label {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        /* BULK USER TAGS INPUT */
+        .tags-input-wrapper {
+            border: 1px solid var(--border-color);
+            background-color: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            padding: 8px 12px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            min-height: 48px;
+            align-items: center;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            cursor: text;
+        }
+
+        .tags-input-wrapper:focus-within {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px var(--primary-glow);
+        }
+
+        .tag {
+            background: rgba(56, 189, 248, 0.08);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            color: var(--primary);
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            animation: tagPop 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+
+        .tag img {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #1e293b;
+        }
+
+        .tag-remove {
+            cursor: pointer;
+            color: var(--text-faint);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: color 0.15s;
+        }
+
+        .tag-remove:hover {
+            color: var(--danger);
+        }
+
+        .tags-input {
+            border: none;
+            outline: none;
+            background: transparent;
+            color: var(--text-primary);
+            font-family: var(--font-inter);
+            font-size: 13px;
+            flex: 1;
+            min-width: 120px;
+            padding: 4px 0;
+        }
+
+        .input-hint {
+            font-size: 11px;
+            color: var(--text-faint);
+            margin-top: 2px;
+        }
+
+        /* ROLE SELECTOR GRID */
+        .role-selector-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+
+        .role-option {
+            border: 1px solid var(--border-color);
+            background-color: rgba(255, 255, 255, 0.01);
+            border-radius: 10px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-align: center;
+        }
+
+        .role-option:hover {
+            background-color: rgba(255, 255, 255, 0.03);
+            border-color: var(--text-faint);
+        }
+
+        .role-option.selected {
+            background-color: var(--primary-glow);
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        .role-option i {
+            font-size: 18px;
+        }
+
+        .role-option span {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .role-option p {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .role-option.selected p {
+            color: var(--primary-hover);
+        }
+
+        /* TAB GRID FOR ACCESS SWITCHES */
+        .tab-access-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+            padding: 15px;
+            border-radius: 12px;
+        }
+
+        .tab-checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 12px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.01);
+            border: 1px solid var(--border-soft);
+            transition: all 0.15s ease;
+        }
+
+        .tab-checkbox-label:hover {
+            background: rgba(255, 255, 255, 0.03);
+            border-color: var(--text-faint);
+        }
+
+        .tab-checkbox-label.active {
+            background: rgba(56, 189, 248, 0.05);
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        .tab-checkbox-label input {
+            accent-color: var(--primary);
+            width: 16px;
+            height: 16px;
+        }
+
+        /* PERMISSIONS ACCORDION SECTIONS */
+        .permissions-section {
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            background-color: rgba(0,0,0,0.15);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transition: all 0.2s ease;
+            margin-top: 10px;
+        }
+
+        .permissions-section.disabled {
+            opacity: 0.35;
+            pointer-events: none;
+            max-height: 52px;
+        }
+
+        .accordion-header {
+            padding: 14px 18px;
+            background-color: rgba(255,255,255,0.01);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.2s;
+        }
+
+        .accordion-header:hover {
+            background-color: rgba(255,255,255,0.03);
+        }
+
+        .accordion-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .accordion-title i {
+            color: var(--primary);
+            width: 16px;
+            text-align: center;
+        }
+
+        .accordion-icon {
+            transition: transform 0.2s;
+            color: var(--text-faint);
+        }
+
+        .permissions-section.open .accordion-icon {
+            transform: rotate(180deg);
+        }
+
+        .accordion-content {
+            display: none;
+            padding: 18px;
+            border-bottom: 1px solid var(--border-color);
+            flex-direction: column;
+            gap: 15px;
+            animation: slideDown 0.2s ease-out;
+        }
+
+        .permissions-section.open .accordion-content {
+            display: flex;
+        }
+
+        .perm-col-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        /* TEXT INPUT FIELDS STYLING */
+        .text-input-field {
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            outline: none;
+            width: 100%;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .text-input-field:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px var(--primary-glow);
+        }
+
+        /* DYNAMIC GROUP CARD (FOR PER-CONTAINER / PER-COMMAND CONFIGS) */
+        .config-group-card {
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-soft);
+            border-radius: 10px;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .config-group-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .config-group-title i {
+            color: var(--primary);
+        }
+
+        .checkboxes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+            gap: 8px;
+            padding-left: 5px;
+        }
+
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--text-secondary);
+            user-select: none;
+        }
+
+        .checkbox-label input {
+            accent-color: var(--primary);
+            width: 14px;
+            height: 14px;
+            cursor: pointer;
+        }
+
+        .checkbox-label:hover {
+            color: var(--text-primary);
+        }
+
+        /* LIVE PAYLOAD SCREEN */
+        .payload-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 25px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            max-height: 88vh;
+            position: sticky;
+            top: 20px;
+        }
+
+        .payload-title {
+            font-family: var(--font-outfit);
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .payload-title span {
+            font-size: 11px;
+            padding: 3px 6px;
+            border-radius: 4px;
+            background-color: rgba(56, 189, 248, 0.1);
+            color: var(--primary);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            text-transform: uppercase;
+        }
+
+        .payload-code {
+            background-color: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 15px;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: #38bdf8;
+            overflow-y: auto;
+            flex: 1;
+            line-height: 1.5;
+            white-space: pre-wrap;
+        }
+
+        /* MEMBERS LIST SIMULATOR */
+        .members-simulator-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px;
+            margin-top: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+        }
+
+        .member-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: rgba(255, 255, 255, 0.01);
+            border: 1px solid var(--border-soft);
+            padding: 10px 15px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .member-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .member-info img {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+        }
+
+        .member-info div {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .member-info span {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .member-info p {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .member-role-badge {
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--primary);
+            background: var(--primary-glow);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            padding: 2px 6px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            margin-left: 10px;
+        }
+
+        /* BUTTONS */
+        .btn {
+            background-color: var(--primary);
+            border: none;
+            color: var(--bg-darker);
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.2);
+        }
+
+        .btn:hover {
+            background-color: var(--primary-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(56, 189, 248, 0.3);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-secondary {
+            background-color: rgba(255,255,255,0.02);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.15s;
+        }
+
+        .btn-secondary:hover {
+            background-color: rgba(255,255,255,0.05);
+            border-color: var(--text-secondary);
+        }
+
+        /* TOAST SUCCESS */
+        .toast {
+            position: fixed;
+            bottom: 25px;
+            right: 25px;
+            background-color: var(--bg-card);
+            border: 1px solid var(--success);
+            padding: 16px 24px;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            z-index: 10000;
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        .toast i {
+            color: var(--success);
+            font-size: 18px;
+        }
+
+        .toast-content h4 {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .toast-content p {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        /* KEYFRAMES */
+        @keyframes tagPop {
+            0% { transform: scale(0.8); opacity: 0; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        @keyframes slideDown {
+            0% { opacity: 0; transform: translateY(-5px); }
+            100% { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1><i class="fa-solid fa-user-shield"></i> User Invitation &amp; Permissions Configurator</h1>
+        <p>Set custom dashboard tab visibility, visibility rules, and allowed commands matching server capabilities.</p>
+    </header>
+
+    <div class="container">
+        <!-- LHS FORM CARD -->
+        <div>
+            <div class="card" id="main-configurator-card">
+                <div class="card-title">
+                    <span id="config-card-header">Invite Team Members</span>
+                    <span style="font-size: 12px; color: var(--text-faint);"><i class="fa-solid fa-server"></i> production-edge-01</span>
+                </div>
+
+                <!-- Bulk GitHub usernames / Edit User Label -->
+                <div class="form-group" id="user-input-group">
+                    <label for="tags-input-elem"><i class="fa-brands fa-github"></i> GitHub Usernames</label>
+                    <div class="tags-input-wrapper" id="tags-input-container" onclick="focusTagsInput()">
+                        <div id="tags-list" style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center;"></div>
+                        <input type="text" class="tags-input" id="tags-input-elem" placeholder="Type and press Enter or Comma...">
+                    </div>
+                    <div class="input-hint" id="user-input-hint">Enter multiple usernames separated by spaces, commas, or Enter. E.g., ayyan, octocat, torvalds</div>
+                </div>
+
+                <!-- Read Only User Label in Edit Mode -->
+                <div class="form-group" id="user-edit-group" style="display: none;">
+                    <label><i class="fa-brands fa-github"></i> Editing Member Permissions</label>
+                    <div class="member-row" style="margin-top: 0; background: rgba(56, 189, 248, 0.05); border-color: var(--primary);">
+                        <div class="member-info">
+                            <img id="edit-user-avatar" src="https://github.com/ayyan.png?size=32" alt="Avatar">
+                            <div>
+                                <span id="edit-user-name" style="font-size: 14px;">ayyan</span>
+                                <p id="edit-user-email">ayyan@github.com</p>
+                            </div>
+                        </div>
+                        <button class="btn-secondary" onclick="exitEditMode()" style="font-size: 11px; padding: 4px 10px;"><i class="fa-solid fa-xmark"></i> Cancel Edit</button>
+                    </div>
+                </div>
+
+                <!-- Role Selector Profiles -->
+                <div class="form-group">
+                    <label><i class="fa-solid fa-id-badge"></i> Profile Preset</label>
+                    <div class="role-selector-grid">
+                        <div class="role-option selected" data-role="viewer" onclick="selectRole('viewer')">
+                            <i class="fa-solid fa-eye"></i>
+                            <span>Viewer</span>
+                            <p>Read-only access to metrics and configuration panels</p>
+                        </div>
+                        <div class="role-option" data-role="operator" onclick="selectRole('operator')">
+                            <i class="fa-solid fa-bolt"></i>
+                            <span>Operator</span>
+                            <p>Allowed to execute custom commands and docker tasks</p>
+                        </div>
+                        <div class="role-option" data-role="admin" onclick="selectRole('admin')">
+                            <i class="fa-solid fa-user-gear"></i>
+                            <span>Admin</span>
+                            <p>Full control over server members, actions, and settings</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fine-grained Section -->
+                <div class="form-group" style="margin-top: 10px;">
+                    <label><i class="fa-solid fa-sliders"></i> Granular Tab &amp; Action Permissions Override</label>
+
+                    <!-- SECTION 0: TABS LEVEL 1 CONTROL -->
+                    <div class="permissions-section open" id="tabs-access-section">
+                        <div class="accordion-header" style="cursor: default; background: rgba(255,255,255,0.02);">
+                            <div class="accordion-title">
+                                <i class="fa-solid fa-table-columns"></i> 1. Dashboard Tab Access (Allow / Disallow View)
+                            </div>
+                        </div>
+                        <div style="padding: 18px; display: flex; flex-direction: column; gap: 15px;">
+                            <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 5px;">
+                                Enable the specific tab panels this user is authorized to view on the server detail card:
+                            </p>
+                            <div class="tab-access-grid">
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-overview" checked value="overview" onchange="toggleTabSetting('overview')"> Overview</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-history" checked value="history" onchange="toggleTabSetting('history')"> History</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-applications" checked value="applications" onchange="toggleTabSetting('applications')"> Applications</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-processes" checked value="processes" onchange="toggleTabSetting('processes')"> Processes</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-storage" checked value="storage" onchange="toggleTabSetting('storage')"> Storage</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-containers" checked value="containers" onchange="toggleTabSetting('containers')"> Containers</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-systemlogs" checked value="systemlogs" onchange="toggleTabSetting('systemlogs')"> System Logs</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-networks" checked value="networks" onchange="toggleTabSetting('networks')"> Networks</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-alerts" checked value="alerts" onchange="toggleTabSetting('alerts')"> Alerts</label>
+                                <label class="tab-checkbox-label active"><input type="checkbox" id="tab-commands" checked value="commands" onchange="toggleTabSetting('commands')"> Commands</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 1: APPLICATIONS (ONLY VIEW OVERRIDES) -->
+                    <div class="permissions-section" id="sec-applications">
+                        <div class="accordion-header" onclick="toggleAccordion('sec-applications')">
+                            <div class="accordion-title">
+                                <i class="fa-solid fa-cubes"></i> 2. Applications Tab Visibility Controls
+                            </div>
+                            <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                        </div>
+                        <div class="accordion-content">
+                            <div class="perm-col-title">Visible Applications Filter</div>
+                            <div style="display:flex; flex-direction:column; gap:10px;">
+                                <label class="checkbox-label" style="font-size: 13px;">
+                                    <input type="checkbox" id="all-apps-checkbox" checked onchange="toggleAllAppsState()"> Allow all applications (*)
+                                </label>
+                                <div id="custom-apps-input-group" style="display: none; flex-direction: column; gap: 6px;">
+                                    <input type="text" id="custom-apps-input" class="text-input-field" placeholder="Type application names separated by commas (e.g., node, python, go)" oninput="updatePayload()">
+                                    <div class="input-hint">Separate multiple names with commas or spaces. E.g., postgres, nginx, sidekiq</div>
+                                </div>
+                            </div>
+                            <p style="font-size: 11px; color: var(--text-faint); margin-top: 5px;">
+                                Applications correspond to aggregated process names. Visibility determines if their stats appear in the Services tab.
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 2: PROCESSES (ONLY VIEW OVERRIDES) -->
+                    <div class="permissions-section" id="sec-processes">
+                        <div class="accordion-header" onclick="toggleAccordion('sec-processes')">
+                            <div class="accordion-title">
+                                <i class="fa-solid fa-microchip"></i> 3. Processes Tab Visibility Controls
+                            </div>
+                            <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                        </div>
+                        <div class="accordion-content">
+                            <div class="perm-col-title">Visible Processes Filter</div>
+                            <div style="display:flex; flex-direction:column; gap:10px;">
+                                <label class="checkbox-label" style="font-size: 13px;">
+                                    <input type="checkbox" id="all-procs-checkbox" checked onchange="toggleAllProcsState()"> Allow all processes (*)
+                                </label>
+                                <div id="custom-procs-input-group" style="display: none; flex-direction: column; gap: 6px;">
+                                    <input type="text" id="custom-procs-input" class="text-input-field" placeholder="Type process names separated by commas (e.g., systemd, dockerd, sshd)" oninput="updatePayload()">
+                                    <div class="input-hint">Separate multiple names with commas or spaces. E.g., bash, uwsgi, journald</div>
+                                </div>
+                            </div>
+                            <p style="font-size: 11px; color: var(--text-faint); margin-top: 5px;">
+                                System processes are read-only.
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 3: CONTAINERS (VISIBILITY & DOCKER COMMANDS) -->
+                    <div class="permissions-section" id="sec-containers">
+                        <div class="accordion-header" onclick="toggleAccordion('sec-containers')">
+                            <div class="accordion-title">
+                                <i class="fa-solid fa-box"></i> 4. Containers Visibility &amp; Command Access
+                            </div>
+                            <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                        </div>
+                        <div class="accordion-content">
+                            <div style="display:flex; flex-direction:column; gap:10px; margin-bottom: 12px;">
+                                <label class="checkbox-label" style="font-size: 12px; cursor: pointer;">
+                                    <input type="checkbox" id="all-conts-checkbox" checked onchange="toggleAllContsState()"> Allow all containers (*)
+                                </label>
+                            </div>
+                            
+                            <div style="display:flex; flex-direction:column; gap:12px;" id="containers-configs-container">
+                                <!-- Container 1 -->
+                                <div class="config-group-card" data-container="nginx-gateway">
+                                    <div class="config-group-title" style="display: flex; align-items: center; justify-content: space-between;">
+                                        <label style="display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; font-size: 13px;">
+                                            <input type="checkbox" class="container-vis-cb" value="nginx-gateway" checked onchange="toggleContainerRowOps('nginx-gateway', this.checked)">
+                                            <i class="fa-solid fa-cube" style="color: var(--primary);"></i> nginx-gateway
+                                        </label>
+                                    </div>
+                                    <div class="container-ops-grid checkboxes-grid" id="ops-for-nginx-gateway" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.05);">
+                                        <label class="checkbox-label"><input type="checkbox" value="start" checked onchange="updatePayload()"> start</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="stop" checked onchange="updatePayload()"> stop</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="pause" checked onchange="updatePayload()"> pause</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="unpause" checked onchange="updatePayload()"> unpause</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="restart" checked onchange="updatePayload()"> restart</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="logs" checked onchange="updatePayload()"> logs</label>
+                                    </div>
+                                </div>
+                                
+                                <!-- Container 2 -->
+                                <div class="config-group-card" data-container="postgres-db">
+                                    <div class="config-group-title" style="display: flex; align-items: center; justify-content: space-between;">
+                                        <label style="display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; font-size: 13px;">
+                                            <input type="checkbox" class="container-vis-cb" value="postgres-db" checked onchange="toggleContainerRowOps('postgres-db', this.checked)">
+                                            <i class="fa-solid fa-cube" style="color: var(--primary);"></i> postgres-db
+                                        </label>
+                                    </div>
+                                    <div class="container-ops-grid checkboxes-grid" id="ops-for-postgres-db" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.05);">
+                                        <label class="checkbox-label"><input type="checkbox" value="start" checked onchange="updatePayload()"> start</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="stop" checked onchange="updatePayload()"> stop</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="pause" checked onchange="updatePayload()"> pause</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="unpause" checked onchange="updatePayload()"> unpause</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="restart" checked onchange="updatePayload()"> restart</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="logs" checked onchange="updatePayload()"> logs</label>
+                                    </div>
+                                </div>
+                                
+                                <!-- Container 3 -->
+                                <div class="config-group-card" data-container="redis-cache">
+                                    <div class="config-group-title" style="display: flex; align-items: center; justify-content: space-between;">
+                                        <label style="display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; font-size: 13px;">
+                                            <input type="checkbox" class="container-vis-cb" value="redis-cache" checked onchange="toggleContainerRowOps('redis-cache', this.checked)">
+                                            <i class="fa-solid fa-cube" style="color: var(--primary);"></i> redis-cache
+                                        </label>
+                                    </div>
+                                    <div class="container-ops-grid checkboxes-grid" id="ops-for-redis-cache" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.05);">
+                                        <label class="checkbox-label"><input type="checkbox" value="start" checked onchange="updatePayload()"> start</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="stop" checked onchange="updatePayload()"> stop</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="pause" checked onchange="updatePayload()"> pause</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="unpause" checked onchange="updatePayload()"> unpause</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="restart" checked onchange="updatePayload()"> restart</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="logs" checked onchange="updatePayload()"> logs</label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 4: COMMANDS (DYNAMIC COMMAND CHECKBOXES PER SERVICE GROUP) -->
+                    <div class="permissions-section" id="sec-commands">
+                        <div class="accordion-header" onclick="toggleAccordion('sec-commands')">
+                            <div class="accordion-title">
+                                <i class="fa-solid fa-terminal"></i> 5. Custom Commands Action Access
+                            </div>
+                            <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                        </div>
+                        <div class="accordion-content">
+                            <p style="font-size:12px; color:var(--text-secondary); margin-bottom: 5px;">
+                                Configure execution authorizations for registered shell Command Groups:
+                            </p>
+                            
+                            <div style="display:flex; flex-direction:column; gap:12px;" id="commands-configs-container">
+                                <!-- Command Set 1 -->
+                                <div class="config-group-card" data-service="Nginx">
+                                    <div class="config-group-title">
+                                        <i class="fa-solid fa-folder-tree"></i> Nginx Commands Group
+                                    </div>
+                                    <div class="checkboxes-grid">
+                                        <label class="checkbox-label"><input type="checkbox" value="reload" checked onchange="updatePayload()"> reload</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="restart" checked onchange="updatePayload()"> restart</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="status" checked onchange="updatePayload()"> status</label>
+                                    </div>
+                                </div>
+                                
+                                <!-- Command Set 2 -->
+                                <div class="config-group-card" data-service="PostgreSQL">
+                                    <div class="config-group-title">
+                                        <i class="fa-solid fa-folder-tree"></i> PostgreSQL Commands Group
+                                    </div>
+                                    <div class="checkboxes-grid">
+                                        <label class="checkbox-label"><input type="checkbox" value="backup" checked onchange="updatePayload()"> backup</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="restart" checked onchange="updatePayload()"> restart</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="status" checked onchange="updatePayload()"> status</label>
+                                    </div>
+                                </div>
+                                
+                                <!-- Command Set 3 -->
+                                <div class="config-group-card" data-service="Vite-App">
+                                    <div class="config-group-title">
+                                        <i class="fa-solid fa-folder-tree"></i> Vite-App Commands Group
+                                    </div>
+                                    <div class="checkboxes-grid">
+                                        <label class="checkbox-label"><input type="checkbox" value="deploy" checked onchange="updatePayload()"> deploy</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="start" checked onchange="updatePayload()"> start</label>
+                                        <label class="checkbox-label"><input type="checkbox" value="stop" checked onchange="updatePayload()"> stop</label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 5: ALERTS TAB CONFIGURATION ACCESS -->
+                    <div class="permissions-section" id="sec-alerts">
+                        <div class="accordion-header" onclick="toggleAccordion('sec-alerts')">
+                            <div class="accordion-title">
+                                <i class="fa-solid fa-bell"></i> 6. Alerts Tab Configuration Access
+                            </div>
+                            <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                        </div>
+                        <div class="accordion-content" style="flex-direction: column; gap: 8px;">
+                            <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="manage-alerts-checkbox" checked onchange="updatePayload()"> Operator can create/edit/delete alert rules</label>
+                            <div style="font-size: 10px; color: var(--text-faint);">If unchecked, operators will only be able to view alerts (view-only). Admins always have full rule management access.</div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+
+                <!-- Submit Button -->
+                <button class="btn" id="submit-action-btn" onclick="sendInvites()"><i class="fa-solid fa-paper-plane"></i> Send Bulk Invites</button>
+            </div>
+
+            <!-- SERVER TEAM MEMBERS LIST SIMULATOR -->
+            <div class="members-simulator-card">
+                <div class="card-title" style="border-bottom: 1px solid var(--border-color); padding-bottom: 12px; margin-bottom: 10px;">
+                    <span>Server Access &amp; Members List (Simulator)</span>
+                    <span style="font-size: 11px; padding: 2px 6px; border-radius: 4px; background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.25);">Admin View</span>
+                </div>
+                <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 5px;">
+                    This simulated dashboard panel lists the current users with server access. Click the gears to edit their fine-grained permissions.
+                </p>
+
+                <div id="members-list-container">
+                    <!-- Member 1 -->
+                    <div class="member-row">
+                        <div class="member-info">
+                            <img src="https://github.com/ayyan.png?size=40" onerror="this.src='https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png'">
+                            <div>
+                                <span>ayyan</span>
+                                <p>ayyan@github.com</p>
+                            </div>
+                            <span class="member-role-badge">Operator</span>
+                        </div>
+                        <button class="btn-secondary" onclick="editMemberPermissions('ayyan', 'operator')"><i class="fa-solid fa-user-gear"></i> Configure Permissions</button>
+                    </div>
+
+                    <!-- Member 2 -->
+                    <div class="member-row">
+                        <div class="member-info">
+                            <img src="https://github.com/octocat.png?size=40" onerror="this.src='https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png'">
+                            <div>
+                                <span>octocat</span>
+                                <p>octocat@github.com</p>
+                            </div>
+                            <span class="member-role-badge">Viewer</span>
+                        </div>
+                        <button class="btn-secondary" onclick="editMemberPermissions('octocat', 'viewer')"><i class="fa-solid fa-user-gear"></i> Configure Permissions</button>
+                    </div>
+
+                    <!-- Member 3 -->
+                    <div class="member-row">
+                        <div class="member-info">
+                            <img src="https://github.com/torvalds.png?size=40" onerror="this.src='https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png'">
+                            <div>
+                                <span>torvalds</span>
+                                <p>torvalds@github.com</p>
+                            </div>
+                            <span class="member-role-badge">Admin</span>
+                        </div>
+                        <span style="font-size: 11px; color: var(--text-faint); font-style: italic; padding-right: 10px;">Full Access (Owner)</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- RHS PAYLOAD LIVE VIEWER -->
+        <div class="payload-card">
+            <div class="payload-title">
+                <span id="payload-action-type">Live Payload Preview</span>
+                <span id="payload-http-method">POST payload</span>
+            </div>
+            <div class="payload-code" id="payload-output">Loading payload structure...</div>
+            <div style="font-size: 12px; color: var(--text-faint); line-height: 1.4;">
+                This pane displays the dynamically constructed payload structure that will be dispatched to the backend. It dynamically shifts schema between <code style="color:var(--primary)">POST</code> (bulk invites) and <code style="color:var(--warning)">PUT</code> (member permission update) actions.
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification toast -->
+    <div class="toast" id="toast-success">
+        <i class="fa-solid fa-circle-check"></i>
+        <div class="toast-content">
+            <h4 id="toast-title">Invites Sent Successfully</h4>
+            <p id="toast-desc">2 user(s) invited with custom fine-grained permissions.</p>
+        </div>
+    </div>
+
+    <script>
+        // Set of invited usernames
+        const usernames = new Set(['ayyan', 'octocat']);
+        
+        let currentRole = 'viewer';
+        let editMode = false;
+        let editingUsername = null;
+
+        // Keep track of active tabs
+        const allowedTabs = new Set([
+            'overview', 'history', 'applications', 'processes', 'storage', 
+            'containers', 'systemlogs', 'networks', 'alerts', 'commands'
+        ]);
+
+        // Set tag-input logic
+        const inputElem = document.getElementById('tags-input-elem');
+        const container = document.getElementById('tags-input-container');
+        const listElem = document.getElementById('tags-list');
+
+        function focusTagsInput() {
+            if (editMode) return;
+            inputElem.focus();
+        }
+
+        function renderTags() {
+            listElem.innerHTML = '';
+            usernames.forEach(name => {
+                const tag = document.createElement('div');
+                tag.className = 'tag';
+                tag.innerHTML = `
+                    <img src="https://github.com/${name}.png?size=32" onerror="this.src='https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png'">
+                    <span>${name}</span>
+                    <span class="tag-remove" onclick="removeTag('${name}')"><i class="fa-solid fa-xmark"></i></span>
+                `;
+                listElem.appendChild(tag);
+            });
+            updateSubmitButtonText();
+            updatePayload();
+        }
+
+        function addTag(name) {
+            if (editMode) return;
+            name = name.trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
+            if (name && !usernames.has(name)) {
+                usernames.add(name);
+                renderTags();
+            }
+            inputElem.value = '';
+        }
+
+        function removeTag(name) {
+            if (editMode) return;
+            usernames.delete(name);
+            renderTags();
+        }
+
+        inputElem.addEventListener('keydown', (e) => {
+            if (editMode) return;
+            if (e.key === 'Enter' || e.key === ',') {
+                e.preventDefault();
+                addTag(inputElem.value);
+            } else if (e.key === 'Backspace' && inputElem.value === '' && usernames.size > 0) {
+                // Delete last user
+                const arr = Array.from(usernames);
+                usernames.delete(arr[arr.length - 1]);
+                renderTags();
+            }
+        });
+
+        // Add support for pasting
+        inputElem.addEventListener('blur', () => {
+            if (editMode) return;
+            if (inputElem.value.trim()) {
+                addTag(inputElem.value);
+            }
+        });
+        
+        inputElem.addEventListener('input', (e) => {
+            if (editMode) return;
+            if (inputElem.value.includes(' ')) {
+                const parts = inputElem.value.split(/[\s,]+/);
+                parts.forEach(part => addTag(part));
+            }
+        });
+
+        // Accordion toggle
+        function toggleAccordion(id) {
+            const el = document.getElementById(id);
+            if (el.classList.contains('disabled')) return;
+            if (el.classList.contains('open')) {
+                el.classList.remove('open');
+            } else {
+                el.classList.add('open');
+            }
+        }
+
+        // Toggle level 1 tabs check states
+        function toggleTabSetting(tabId) {
+            const cb = document.getElementById(`tab-${tabId}`);
+            const label = cb.parentElement;
+            
+            if (cb.checked) {
+                allowedTabs.add(tabId);
+                label.classList.add('active');
+            } else {
+                allowedTabs.delete(tabId);
+                label.classList.remove('active');
+            }
+            
+            syncSectionsVisibility();
+            updatePayload();
+        }
+
+        // Toggle "Allow All Applications" checkbox
+        function toggleAllAppsState() {
+            const isAllChecked = document.getElementById('all-apps-checkbox').checked;
+            const customInputGroup = document.getElementById('custom-apps-input-group');
+            if (isAllChecked) {
+                customInputGroup.style.display = 'none';
+            } else {
+                customInputGroup.style.display = 'flex';
+                document.getElementById('custom-apps-input').focus();
+            }
+            updatePayload();
+        }
+
+        // Toggle "Allow All Processes" checkbox
+        function toggleAllProcsState() {
+            const isAllChecked = document.getElementById('all-procs-checkbox').checked;
+            const customInputGroup = document.getElementById('custom-procs-input-group');
+            if (isAllChecked) {
+                customInputGroup.style.display = 'none';
+            } else {
+                customInputGroup.style.display = 'flex';
+                document.getElementById('custom-procs-input').focus();
+            }
+            updatePayload();
+        }
+
+        function toggleAllContsState() {
+            const isAll = document.getElementById('all-conts-checkbox').checked;
+            document.querySelectorAll('.container-vis-cb').forEach(cb => {
+                cb.checked = isAll;
+                toggleContainerRowOps(cb.value, isAll);
+            });
+            updatePayload();
+        }
+
+        function toggleContainerRowOps(name, isChecked) {
+            const grid = document.getElementById(`ops-for-${name}`);
+            if (grid) {
+                if (isChecked && currentRole === 'operator') {
+                    grid.style.display = 'grid';
+                } else {
+                    grid.style.display = 'none';
+                }
+            }
+            const wrapper = document.getElementById(`ops-for-${name}`);
+            if (wrapper) {
+                wrapper.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                    cb.checked = isChecked;
+                });
+            }
+            if (!isChecked) {
+                document.getElementById('all-conts-checkbox').checked = false;
+            } else {
+                const total = document.querySelectorAll('.container-vis-cb').length;
+                const checked = document.querySelectorAll('.container-vis-cb:checked').length;
+                if (total > 0 && total === checked) {
+                    document.getElementById('all-conts-checkbox').checked = true;
+                }
+            }
+            updatePayload();
+        }
+
+        // Enable or disable section accordion cards depending on whether their tab is allowed
+        function syncSectionsVisibility() {
+            if (currentRole === 'admin') {
+                return;
+            }
+            const appSection = document.getElementById('sec-applications');
+            const procSection = document.getElementById('sec-processes');
+            const contSection = document.getElementById('sec-containers');
+            const cmdSection = document.getElementById('sec-commands');
+            const alertsSection = document.getElementById('sec-alerts');
+
+            toggleSectionState(appSection, allowedTabs.has('applications'));
+            toggleSectionState(procSection, allowedTabs.has('processes'));
+            toggleSectionState(contSection, allowedTabs.has('containers'));
+            toggleSectionState(cmdSection, allowedTabs.has('commands'));
+            toggleSectionState(alertsSection, allowedTabs.has('alerts'));
+        }
+
+        function toggleSectionState(el, isEnabled) {
+            if (!el) return;
+            if (isEnabled) {
+                el.classList.remove('disabled');
+            } else {
+                el.classList.add('disabled');
+                el.classList.remove('open');
+            }
+        }
+
+        // Preset switching
+        function selectRole(role) {
+            document.querySelectorAll('.role-option').forEach(el => el.classList.remove('selected'));
+            document.querySelector(`[data-role="${role}"]`).classList.add('selected');
+            currentRole = role;
+
+            const tabsControls = document.getElementById('tabs-access-section');
+            const appSection = document.getElementById('sec-applications');
+            const procSection = document.getElementById('sec-processes');
+            const contSection = document.getElementById('sec-containers');
+            const cmdSection = document.getElementById('sec-commands');
+            const alertsSection = document.getElementById('sec-alerts');
+
+            const manageAlertsCheckbox = document.getElementById('manage-alerts-checkbox');
+
+            if (role === 'admin') {
+                // Admin has full power, lock customizer
+                tabsControls.classList.add('disabled');
+                appSection.classList.add('disabled');
+                procSection.classList.add('disabled');
+                contSection.classList.add('disabled');
+                cmdSection.classList.add('disabled');
+                alertsSection.classList.add('disabled');
+
+                // Check all tabs in UI
+                document.querySelectorAll('#tabs-list-checkboxes input').forEach(input => {
+                    input.checked = true;
+                    input.parentElement.classList.add('active');
+                });
+                
+                // Set sets to all
+                allowedTabs.clear();
+                [
+                    'overview', 'history', 'applications', 'processes', 'storage', 
+                    'containers', 'systemlogs', 'networks', 'alerts', 'commands'
+                ].forEach(t => allowedTabs.add(t));
+                
+                // Set checkboxes to allow all
+                document.getElementById('all-apps-checkbox').checked = true;
+                document.getElementById('all-procs-checkbox').checked = true;
+                document.getElementById('all-conts-checkbox').checked = true;
+                if (manageAlertsCheckbox) manageAlertsCheckbox.checked = true;
+                document.getElementById('custom-apps-input-group').style.display = 'none';
+                document.getElementById('custom-procs-input-group').style.display = 'none';
+
+                // Admin checks all container visibility and actions
+                document.querySelectorAll('.container-vis-cb, .container-ops-grid input').forEach(input => {
+                    input.checked = true;
+                });
+                document.querySelectorAll('.container-ops-grid').forEach(grid => grid.style.display = 'none');
+            } else {
+                tabsControls.classList.remove('disabled');
+                
+                // Restore tabs checkboxes states in UI
+                document.querySelectorAll('#tabs-list-checkboxes input').forEach(input => {
+                    const id = input.value;
+                    input.checked = allowedTabs.has(id);
+                    if (allowedTabs.has(id)) {
+                        input.parentElement.classList.add('active');
+                    } else {
+                        input.parentElement.classList.remove('active');
+                    }
+                });
+
+                syncSectionsVisibility();
+
+                if (role === 'viewer') {
+                    document.querySelectorAll('.container-ops-grid').forEach(grid => grid.style.display = 'none');
+                    cmdSection.classList.add('disabled');
+                    cmdSection.classList.remove('open');
+                    if (manageAlertsCheckbox) manageAlertsCheckbox.checked = false;
+                    if (alertsSection) {
+                        alertsSection.classList.add('disabled');
+                        alertsSection.classList.remove('open');
+                    }
+                } else { // operator
+                    // Show command grids for checked containers
+                    document.querySelectorAll('.container-vis-cb').forEach(cb => {
+                        const grid = document.getElementById(`ops-for-${cb.value}`);
+                        if (grid) {
+                            grid.style.display = cb.checked ? 'grid' : 'none';
+                        }
+                    });
+
+                    const cmdTabEnabled = allowedTabs.has('commands');
+                    toggleSectionState(cmdSection, cmdTabEnabled);
+
+                    const alertsTabEnabled = allowedTabs.has('alerts');
+                    toggleSectionState(alertsSection, alertsTabEnabled);
+                    if (manageAlertsCheckbox) manageAlertsCheckbox.checked = true;
+                }
+            }
+
+            updatePayload();
+        }
+
+        // Edit existing member permissions handler
+        function editMemberPermissions(username, role) {
+            editMode = true;
+            editingUsername = username;
+            
+            // Scroll to the main card
+            document.getElementById('main-configurator-card').scrollIntoView({ behavior: 'smooth' });
+
+            // Update header and user input views
+            document.getElementById('config-card-header').textContent = "Modify Member Permissions";
+            document.getElementById('user-input-group').style.display = 'none';
+            document.getElementById('user-edit-group').style.display = 'block';
+            
+            // Set values in edit card
+            document.getElementById('edit-user-name').textContent = username;
+            document.getElementById('edit-user-email').textContent = `${username}@github.com`;
+            document.getElementById('edit-user-avatar').src = `https://github.com/${username}.png?size=40`;
+
+            // Load role preset
+            selectRole(role);
+
+            // Pre-populate some custom simulated permissions depending on the selected user
+            if (username === 'ayyan') {
+                allowedTabs.clear();
+                allowedTabs.add('overview');
+                allowedTabs.add('commands');
+                
+                // Set custom commands
+                document.querySelectorAll('#commands-configs-container input').forEach(input => {
+                    const card = input.closest('.config-group-card');
+                    const isNginx = card.getAttribute('data-service') === 'Nginx';
+                    input.checked = isNginx;
+                });
+
+                // Reset Apps and Procs visibility
+                document.getElementById('all-apps-checkbox').checked = true;
+                document.getElementById('all-procs-checkbox').checked = true;
+                document.getElementById('custom-apps-input-group').style.display = 'none';
+                document.getElementById('custom-procs-input-group').style.display = 'none';
+            } else if (username === 'octocat') {
+                allowedTabs.clear();
+                allowedTabs.add('overview');
+                allowedTabs.add('history');
+                allowedTabs.add('containers');
+                allowedTabs.add('applications');
+                allowedTabs.add('processes');
+
+                // Limit container commands
+                document.getElementById('all-conts-checkbox').checked = false;
+                document.querySelectorAll('.container-vis-cb').forEach(cb => {
+                    cb.checked = (cb.value === 'nginx-gateway' || cb.value === 'postgres-db');
+                    toggleContainerRowOps(cb.value, cb.checked);
+                });
+                document.querySelectorAll('.container-ops-grid input[type="checkbox"]').forEach(input => {
+                    input.checked = (input.value === 'logs' || input.value === 'restart');
+                });
+
+                // Set apps and processes text override
+                document.getElementById('all-apps-checkbox').checked = false;
+                document.getElementById('all-procs-checkbox').checked = false;
+                document.getElementById('custom-apps-input-group').style.display = 'flex';
+                document.getElementById('custom-procs-input-group').style.display = 'flex';
+                
+                document.getElementById('custom-apps-input').value = "node, python";
+                document.getElementById('custom-procs-input').value = "systemd, sshd";
+            }
+
+            // Sync visual checkbox states
+            document.querySelectorAll('#tabs-list-checkboxes input').forEach(input => {
+                input.checked = allowedTabs.has(input.value);
+                if (input.checked) {
+                    input.parentElement.classList.add('active');
+                } else {
+                    input.parentElement.classList.remove('active');
+                }
+            });
+
+            syncSectionsVisibility();
+            updateSubmitButtonText();
+            updatePayload();
+        }
+
+        // Exit edit mode back to invitation mode
+        function exitEditMode() {
+            editMode = false;
+            editingUsername = null;
+
+            document.getElementById('config-card-header').textContent = "Invite Team Members";
+            document.getElementById('user-input-group').style.display = 'block';
+            document.getElementById('user-edit-group').style.display = 'none';
+
+            // Reset tabs
+            allowedTabs.clear();
+            [
+                'overview', 'history', 'applications', 'processes', 'storage', 
+                'containers', 'systemlogs', 'networks', 'alerts', 'commands'
+            ].forEach(t => allowedTabs.add(t));
+            
+            // Set all container checks to checked
+            document.querySelectorAll('#containers-configs-container input, #commands-configs-container input').forEach(input => {
+                input.checked = true;
+            });
+
+            // Reset custom text inputs
+            document.getElementById('all-apps-checkbox').checked = true;
+            document.getElementById('all-procs-checkbox').checked = true;
+            document.getElementById('all-conts-checkbox').checked = true;
+            const manageAlertsCheckbox = document.getElementById('manage-alerts-checkbox');
+            if (manageAlertsCheckbox) manageAlertsCheckbox.checked = true;
+
+            document.getElementById('custom-apps-input-group').style.display = 'none';
+            document.getElementById('custom-procs-input-group').style.display = 'none';
+            document.getElementById('custom-apps-input').value = '';
+            document.getElementById('custom-procs-input').value = '';
+
+            // Select default Viewer preset
+            selectRole('viewer');
+            renderTags();
+        }
+
+        // Dynamically compute the submit button text based on username counts and modes
+        function updateSubmitButtonText() {
+            const btn = document.getElementById('submit-action-btn');
+            if (!btn) return;
+
+            if (editMode) {
+                btn.innerHTML = `<i class="fa-solid fa-save"></i> Save Permissions`;
+            } else {
+                if (usernames.size === 1) {
+                    btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> Send Invite`;
+                } else {
+                    btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> Send Bulk Invites`;
+                }
+            }
+        }
+
+        // Compute current payload state
+        function updatePayload() {
+            const payloadActionType = document.getElementById('payload-action-type');
+            const payloadHttpMethod = document.getElementById('payload-http-method');
+
+            // Parse application visibility list
+            let appList = ["*"];
+            if (currentRole !== 'admin') {
+                const isAllApps = document.getElementById('all-apps-checkbox').checked;
+                if (!isAllApps) {
+                    const val = document.getElementById('custom-apps-input').value;
+                    appList = val.split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+                }
+            }
+
+            // Parse process visibility list
+            let procList = ["*"];
+            if (currentRole !== 'admin') {
+                const isAllProcs = document.getElementById('all-procs-checkbox').checked;
+                if (!isAllProcs) {
+                    const val = document.getElementById('custom-procs-input').value;
+                    procList = val.split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+                }
+            }
+
+            // Parse container visibility list
+            let contList = ["*"];
+            if (currentRole !== 'admin') {
+                const isAllConts = document.getElementById('all-conts-checkbox').checked;
+                if (!isAllConts) {
+                    contList = [];
+                    document.querySelectorAll('.container-vis-cb:checked').forEach(cb => {
+                        contList.push(cb.value);
+                    });
+                }
+            }
+
+            const manageAlertsCheckbox = document.getElementById('manage-alerts-checkbox');
+            const manageAlerts = manageAlertsCheckbox ? manageAlertsCheckbox.checked : false;
+
+            // Compile containers configuration mapping
+            const containersMap = {};
+            if (currentRole === 'admin') {
+                containersMap['*'] = ['*'];
+            } else if (currentRole === 'operator' && allowedTabs.has('containers')) {
+                document.querySelectorAll('#containers-configs-container .config-group-card').forEach(card => {
+                    const visCb = card.querySelector('.container-vis-cb');
+                    if (visCb && visCb.checked) {
+                        const containerName = card.getAttribute('data-container');
+                        const actions = [];
+                        card.querySelectorAll('.container-ops-grid input:checked').forEach(input => {
+                            actions.push(input.value);
+                        });
+                        containersMap[containerName] = actions;
+                    }
+                });
+            }
+
+            // Compile custom commands mapping
+            const commandsMap = {};
+            if (currentRole === 'admin') {
+                commandsMap['*'] = ['*'];
+            } else if (currentRole === 'operator' && allowedTabs.has('commands')) {
+                document.querySelectorAll('#commands-configs-container .config-group-card').forEach(card => {
+                    const serviceName = card.getAttribute('data-service');
+                    const actions = [];
+                    card.querySelectorAll('input:checked').forEach(input => {
+                        actions.push(input.value);
+                    });
+                    commandsMap[serviceName] = actions;
+                });
+            }
+
+            let payload;
+            if (editMode) {
+                payloadActionType.textContent = "Live Update Permissions Preview";
+                payloadHttpMethod.textContent = "PUT payload";
+                payloadHttpMethod.style.background = "rgba(245, 158, 11, 0.1)";
+                payloadHttpMethod.style.color = "var(--warning)";
+                payloadHttpMethod.style.borderColor = "rgba(245, 158, 11, 0.2)";
+
+                payload = {
+                    server_id: "e581dc41-45bd-4ff2-bc22-38d58c89b252",
+                    username: editingUsername,
+                    role: currentRole,
+                    permissions: {
+                        allowed_tabs: currentRole === 'admin' ? ['*'] : Array.from(allowedTabs),
+                        view_applications: appList,
+                        view_processes: procList,
+                        view_containers: contList,
+                        manage_alerts: currentRole === 'admin' ? true : manageAlerts,
+                        containers: containersMap,
+                        custom_commands: commandsMap
+                    }
+                };
+            } else {
+                payloadActionType.textContent = "Live Send Invitation Preview";
+                payloadHttpMethod.textContent = "POST payload";
+                payloadHttpMethod.style.background = "rgba(56, 189, 248, 0.1)";
+                payloadHttpMethod.style.color = "var(--primary)";
+                payloadHttpMethod.style.borderColor = "rgba(56, 189, 248, 0.2)";
+
+                payload = {
+                    server_id: "e581dc41-45bd-4ff2-bc22-38d58c89b252",
+                    usernames: Array.from(usernames),
+                    role: currentRole,
+                    permissions: {
+                        allowed_tabs: currentRole === 'admin' ? ['*'] : Array.from(allowedTabs),
+                        view_applications: appList,
+                        view_processes: procList,
+                        view_containers: contList,
+                        manage_alerts: currentRole === 'admin' ? true : manageAlerts,
+                        containers: containersMap,
+                        custom_commands: commandsMap
+                    }
+                };
+            }
+
+            document.getElementById('payload-output').textContent = JSON.stringify(payload, null, 2);
+        }
+
+        function sendInvites() {
+            const toastTitle = document.getElementById('toast-title');
+            const toastDesc = document.getElementById('toast-desc');
+
+            if (editMode) {
+                toastTitle.textContent = "Permissions Updated";
+                toastDesc.textContent = `Successfully updated permissions and roles for member '${editingUsername}'.`;
+                
+                // Update badge in simulator table
+                document.querySelectorAll('.member-row').forEach(row => {
+                    const name = row.querySelector('.member-info span').textContent;
+                    if (name === editingUsername) {
+                        row.querySelector('.member-role-badge').textContent = currentRole;
+                    }
+                });
+            } else {
+                if (usernames.size === 0) {
+                    alert("Please add at least one GitHub username.");
+                    return;
+                }
+                toastTitle.textContent = usernames.size === 1 ? "Invite Sent" : "Invites Sent";
+                toastDesc.textContent = usernames.size === 1 
+                    ? `1 user invited successfully with custom permissions.` 
+                    : `${usernames.size} users invited successfully with custom permissions.`;
+            }
+
+            // Show Toast Success
+            const toast = document.getElementById('toast-success');
+            toast.classList.add('show');
+
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 4000);
+        }
+
+        // Init page
+        renderTags();
+        selectRole('viewer');
+
+    </script>
+</body>
+</html>

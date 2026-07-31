@@ -13,6 +13,160 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <!-- Modular CSS Stylesheet -->
     <link rel="stylesheet" href="/static/css/app.css">
+    
+    <style>
+        /* TEAM MODAL CUSTOM STYLES */
+        .tags-input-wrapper:focus-within {
+            border-color: var(--primary) !important;
+            box-shadow: 0 0 0 3px var(--primary-glow) !important;
+        }
+
+        .tag {
+            background: rgba(56, 189, 248, 0.08);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            color: var(--primary);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .tag img {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #1e293b;
+        }
+
+        .tag-remove {
+            cursor: pointer;
+            color: var(--text-faint);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: color 0.15s;
+        }
+
+        .tag-remove:hover {
+            color: var(--danger);
+        }
+
+        .role-option {
+            border: 1px solid var(--border-color);
+            background-color: rgba(255, 255, 255, 0.01);
+            border-radius: 8px;
+            padding: 10px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .role-option:hover {
+            background-color: rgba(255, 255, 255, 0.03);
+            border-color: var(--text-faint);
+        }
+
+        .role-option.selected {
+            background-color: var(--primary-glow);
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        .permissions-section {
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background-color: rgba(0,0,0,0.15);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transition: all 0.2s ease;
+        }
+
+        .permissions-section.disabled {
+            opacity: 0.35;
+            pointer-events: none;
+            max-height: 38px;
+        }
+
+        .accordion-header {
+            padding: 10px 14px;
+            background-color: rgba(255,255,255,0.01);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.2s;
+        }
+
+        .accordion-header:hover {
+            background-color: rgba(255,255,255,0.03);
+        }
+
+        .accordion-icon {
+            transition: transform 0.2s;
+            color: var(--text-faint);
+        }
+
+        .permissions-section.open .accordion-icon {
+            transform: rotate(180deg);
+        }
+
+        .config-group-card {
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-soft);
+            border-radius: 8px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .config-group-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .config-group-title i {
+            color: var(--primary);
+        }
+
+        .checkboxes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+            gap: 6px;
+            padding-left: 2px;
+        }
+
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            font-size: 11px;
+            color: var(--text-secondary);
+            user-select: none;
+        }
+
+        .checkbox-label input {
+            accent-color: var(--primary);
+            width: 12px;
+            height: 12px;
+            cursor: pointer;
+        }
+
+        .checkbox-label:hover {
+            color: var(--text-primary);
+        }
+    </style>
 </head>
 
 <body>
@@ -1005,7 +1159,7 @@
     </div>
     <!-- SERVER MEMBERS / TEAM ACCESS MODAL -->
     <div class="modal-overlay" id="team-modal" style="display:none; z-index: 10006;">
-        <div class="modal-card" style="max-width: 550px; width: 90%; padding: 0;">
+        <div class="modal-card" style="max-width: 680px; width: 90%; padding: 0;">
             <div class="modal-header" style="border-bottom: 1px solid var(--border-color); padding: 16px 20px;">
                 <h3 style="margin: 0; font-size: 16px; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
                     <i class="fa-solid fa-users-gear"></i> Server Access &amp; Team Settings
@@ -1013,28 +1167,160 @@
                 <button class="modal-close-btn" onclick="closeTeamModal()"><i class="fa-solid fa-xmark"></i></button>
             </div>
             
-            <div style="padding: 20px; display: flex; flex-direction: column; gap: 20px;">
+            <div style="padding: 20px; display: flex; flex-direction: column; gap: 20px; max-height: 65vh; overflow-y: auto;">
                 <!-- Add Member Section (Admin Only) -->
-                <div id="team-invite-section" style="border-bottom: 1px solid var(--border-color); padding-bottom: 20px;">
-                    <h4 style="margin: 0 0 10px 0; font-size: 13px; text-transform: uppercase; color: var(--text-secondary); letter-spacing: 0.5px;">Invite Team Member</h4>
-                    <form id="team-invite-form" onsubmit="handleTeamInvite(event)" style="display: flex; gap: 10px; margin: 0;">
-                        <input type="hidden" id="team-server-id">
-                        <input type="text" id="team-invite-username" class="form-control" placeholder="GitHub Username" required style="flex: 2;">
-                        <select id="team-invite-role" class="form-control" style="flex: 1;">
-                            <option value="viewer">Viewer</option>
-                            <option value="operator">Operator</option>
-                            <option value="admin">Admin</option>
-                        </select>
-                        <button type="submit" style="background: var(--primary); border: none; color: white; padding: 0 16px; border-radius: 6px; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 6px;">
-                            <i class="fa-solid fa-user-plus"></i> Invite
-                        </button>
-                    </form>
+                <div id="team-invite-section" style="border-bottom: 1px solid var(--border-color); padding-bottom: 20px; display: flex; flex-direction: column; gap: 15px;">
+                    <h4 id="team-invite-title" style="margin: 0; font-size: 13px; text-transform: uppercase; color: var(--text-secondary); letter-spacing: 0.5px;">Invite Team Member</h4>
+                    
+                    <input type="hidden" id="team-server-id">
+                    
+                    <!-- Bulky GitHub Usernames / Edit User Badge -->
+                    <div id="team-usernames-group" style="display: flex; flex-direction: column; gap: 6px;">
+                        <label style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-secondary);"><i class="fa-brands fa-github"></i> GitHub Usernames</label>
+                        <div class="tags-input-wrapper" id="team-tags-container" style="border: 1px solid var(--border-color); background: rgba(0,0,0,0.2); border-radius: 8px; padding: 8px; display: flex; flex-wrap: wrap; gap: 6px; min-height: 44px; align-items: center; cursor: text;" onclick="focusTeamTagsInput()">
+                            <div id="team-tags-list" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+                            <input type="text" id="team-tags-input" style="border: none; outline: none; background: transparent; color: var(--text-primary); font-size: 13px; flex: 1; min-width: 120px;" placeholder="Type username and press Enter...">
+                        </div>
+                        <div style="font-size: 10px; color: var(--text-faint);">Separate multiple names with space or comma. E.g., dev-user, ops-admin</div>
+                    </div>
+
+                    <!-- Single User Edit Badge (Hidden by default) -->
+                    <div id="team-user-edit-group" style="display: none; align-items: center; justify-content: space-between; background: rgba(56, 189, 248, 0.05); border: 1px solid var(--primary); padding: 10px 15px; border-radius: 8px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <img id="team-edit-avatar" src="" style="width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border-color);" onerror="this.src='https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png'">
+                            <div style="display: flex; flex-direction: column;">
+                                <span id="team-edit-username" style="font-size: 13px; font-weight: 600; color: var(--text-primary);"></span>
+                                <span style="font-size: 11px; color: var(--text-secondary);">Modifying Permissions</span>
+                            </div>
+                        </div>
+                        <button type="button" class="btn-secondary" onclick="exitTeamEditMode()" style="padding: 4px 8px; font-size: 11px;"><i class="fa-solid fa-xmark"></i> Cancel Edit</button>
+                    </div>
+
+                    <!-- Profile Preset selection -->
+                    <div style="display: flex; flex-direction: column; gap: 6px;">
+                        <label style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-secondary);">Profile Preset</label>
+                        <div class="role-selector-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+                            <div class="role-option selected" id="preset-viewer" onclick="selectTeamRole('viewer')" style="border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; text-align: center; cursor: pointer; transition: all 0.2s;">
+                                <i class="fa-solid fa-eye" style="font-size: 16px; margin-bottom: 4px; display: block;"></i>
+                                <span style="font-size: 12px; font-weight: 600; display: block;">Viewer</span>
+                            </div>
+                            <div class="role-option" id="preset-operator" onclick="selectTeamRole('operator')" style="border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; text-align: center; cursor: pointer; transition: all 0.2s;">
+                                <i class="fa-solid fa-bolt" style="font-size: 16px; margin-bottom: 4px; display: block;"></i>
+                                <span style="font-size: 12px; font-weight: 600; display: block;">Operator</span>
+                            </div>
+                            <div class="role-option" id="preset-admin" onclick="selectTeamRole('admin')" style="border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; text-align: center; cursor: pointer; transition: all 0.2s;">
+                                <i class="fa-solid fa-user-gear" style="font-size: 16px; margin-bottom: 4px; display: block;"></i>
+                                <span style="font-size: 12px; font-weight: 600; display: block;">Admin</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Granular Permission Customizer accordion -->
+                    <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 5px;">
+                        <label style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-secondary);"><i class="fa-solid fa-sliders"></i> Fine-Grained Permissions Overrides</label>
+                        
+                        <!-- Tabs Visibility level 1 -->
+                        <div class="permissions-section open" id="tsec-tabs">
+                            <div class="accordion-header" style="padding: 10px 14px; background: rgba(255,255,255,0.02); display: flex; align-items: center; font-size: 13px; font-weight: 600; cursor: default;">
+                                <div style="display: flex; align-items: center;"><i class="fa-solid fa-table-columns" style="color: var(--primary); margin-right: 8px;"></i> 1. Dashboard Tab Access</div>
+                            </div>
+                            <div style="padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; background: rgba(0,0,0,0.2);">
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-overview" checked onchange="toggleTeamTabSetting('overview')"> Overview</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-history" checked onchange="toggleTeamTabSetting('history')"> History</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-applications" checked onchange="toggleTeamTabSetting('applications')"> Applications</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-processes" checked onchange="toggleTeamTabSetting('processes')"> Processes</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-storage" checked onchange="toggleTeamTabSetting('storage')"> Storage</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-containers" checked onchange="toggleTeamTabSetting('containers')"> Containers</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-systemlogs" checked onchange="toggleTeamTabSetting('systemlogs')"> Logs</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-networks" checked onchange="toggleTeamTabSetting('networks')"> Networks</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-alerts" checked onchange="toggleTeamTabSetting('alerts')"> Alerts</label>
+                                <label class="tab-checkbox-label active" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-commands" checked onchange="toggleTeamTabSetting('commands')"> Commands</label>
+                            </div>
+                        </div>
+
+                        <!-- Application visibility overrides -->
+                        <div class="permissions-section" id="tsec-applications">
+                            <div class="accordion-header" onclick="toggleTeamAccordion('tsec-applications')">
+                                <div style="display: flex; align-items: center;"><i class="fa-solid fa-cubes" style="color: var(--primary); margin-right: 8px;"></i> 2. Applications Visibility Controls</div>
+                                <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                            </div>
+                            <div class="accordion-content" style="display: none; padding: 12px; flex-direction: column; gap: 8px; background: rgba(0,0,0,0.2);">
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-all-apps" checked onchange="toggleTeamAllAppsState()"> Allow all applications (*)</label>
+                                <div id="team-custom-apps-group" style="display: none; flex-direction: column; gap: 4px; margin-top: 4px;">
+                                    <input type="text" id="team-custom-apps-input" class="form-control" placeholder="node, python, go..." style="font-size: 12px; padding: 6px 10px;">
+                                    <div style="font-size: 10px; color: var(--text-faint);">Separate names with space or comma.</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Process visibility overrides -->
+                        <div class="permissions-section" id="tsec-processes">
+                            <div class="accordion-header" onclick="toggleTeamAccordion('tsec-processes')">
+                                <div style="display: flex; align-items: center;"><i class="fa-solid fa-microchip" style="color: var(--primary); margin-right: 8px;"></i> 3. Processes Visibility Controls</div>
+                                <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                            </div>
+                            <div class="accordion-content" style="display: none; padding: 12px; flex-direction: column; gap: 8px; background: rgba(0,0,0,0.2);">
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-all-procs" checked onchange="toggleTeamAllProcsState()"> Allow all processes (*)</label>
+                                <div id="team-custom-procs-group" style="display: none; flex-direction: column; gap: 4px; margin-top: 4px;">
+                                    <input type="text" id="team-custom-procs-input" class="form-control" placeholder="systemd, sshd, dockerd..." style="font-size: 12px; padding: 6px 10px;">
+                                    <div style="font-size: 10px; color: var(--text-faint);">Separate names with space or comma.</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Containers permissions configs -->
+                        <div class="permissions-section" id="tsec-containers">
+                            <div class="accordion-header" onclick="toggleTeamAccordion('tsec-containers')">
+                                <div style="display: flex; align-items: center;"><i class="fa-solid fa-box" style="color: var(--primary); margin-right: 8px;"></i> 4. Containers Visibility &amp; Command Access</div>
+                                <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                            </div>
+                            <div class="accordion-content" style="display: none; padding: 12px; flex-direction: column; gap: 10px; background: rgba(0,0,0,0.2);">
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;">
+                                    <input type="checkbox" id="tcb-all-conts" checked onchange="toggleTeamAllContsState()"> Allow all containers (*)
+                                </label>
+                                <div id="team-containers-configs" style="display: flex; flex-direction: column; gap: 10px; margin-top: 5px;">
+                                    <!-- Dynamic list of containers -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Custom commands permissions configs -->
+                        <div class="permissions-section" id="tsec-commands">
+                            <div class="accordion-header" onclick="toggleTeamAccordion('tsec-commands')">
+                                <div style="display: flex; align-items: center;"><i class="fa-solid fa-terminal" style="color: var(--primary); margin-right: 8px;"></i> 5. Custom Commands Action Access</div>
+                                <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                            </div>
+                            <div class="accordion-content" style="display: none; padding: 12px; flex-direction: column; gap: 10px; background: rgba(0,0,0,0.2);">
+                                <p style="font-size: 11px; color: var(--text-secondary); margin: 0;">Configure execution authorizations for command sets:</p>
+                                <div id="team-commands-configs" style="display: flex; flex-direction: column; gap: 10px;">
+                                    <!-- Dynamic list of custom command groups -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Alerts management permissions configs -->
+                        <div class="permissions-section" id="tsec-alerts">
+                            <div class="accordion-header" onclick="toggleTeamAccordion('tsec-alerts')">
+                                <div style="display: flex; align-items: center;"><i class="fa-solid fa-bell" style="color: var(--primary); margin-right: 8px;"></i> 6. Alerts Tab Configuration Access</div>
+                                <i class="fa-solid fa-chevron-down accordion-icon"></i>
+                            </div>
+                            <div class="accordion-content" style="display: none; padding: 12px; flex-direction: column; gap: 8px; background: rgba(0,0,0,0.2);">
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;"><input type="checkbox" id="tcb-manage-alerts" checked> Operator can create/edit/delete alert rules</label>
+                                <div style="font-size: 10px; color: var(--text-faint);">If unchecked, operators will only be able to view alerts (view-only). Admins always have full rule management access.</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Action Submit Button -->
+                    <button type="button" id="team-submit-btn" onclick="submitTeamAction()" style="background: var(--primary); border: none; color: black; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%;">
+                        <i class="fa-solid fa-paper-plane"></i> Send Bulk Invites
+                    </button>
                 </div>
 
                 <!-- Current Members List -->
                 <div>
                     <h4 style="margin: 0 0 10px 0; font-size: 13px; text-transform: uppercase; color: var(--text-secondary); letter-spacing: 0.5px;">Users with Access</h4>
-                    <div id="team-members-list" style="display: flex; flex-direction: column; gap: 10px; max-height: 250px; overflow-y: auto; padding-right: 5px;">
+                    <div id="team-members-list" style="display: flex; flex-direction: column; gap: 10px; max-height: 220px; overflow-y: auto; padding-right: 5px;">
                         <!-- Dynamically populated rows -->
                     </div>
                 </div>

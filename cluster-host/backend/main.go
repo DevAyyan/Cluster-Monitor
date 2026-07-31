@@ -31,19 +31,20 @@ var (
 
 // Structs representing database entities
 type Server struct {
-	ID          string    `json:"id"`
-	Hostname    string    `json:"hostname"`
-	IPAddress   string    `json:"ip_address"`
-	OSFamily    string    `json:"os_family"`
-	AgentToken  string    `json:"agent_token,omitempty"`
-	SSHUser     string    `json:"ssh_user,omitempty"`
-	SSHKey      string    `json:"ssh_key,omitempty"`
-	SSHPassword string    `json:"ssh_password,omitempty"`
-	SSHPort     int       `json:"ssh_port,omitempty"`
-	Status      string    `json:"status"`
-	LastSeen    time.Time `json:"last_seen"`
-	CreatedAt   time.Time `json:"created_at"`
-	Role        string    `json:"role,omitempty"`
+	ID          string           `json:"id"`
+	Hostname    string           `json:"hostname"`
+	IPAddress   string           `json:"ip_address"`
+	OSFamily    string           `json:"os_family"`
+	AgentToken  string           `json:"agent_token,omitempty"`
+	SSHUser     string           `json:"ssh_user,omitempty"`
+	SSHKey      string           `json:"ssh_key,omitempty"`
+	SSHPassword string           `json:"ssh_password,omitempty"`
+	SSHPort     int              `json:"ssh_port,omitempty"`
+	Status      string           `json:"status"`
+	LastSeen    time.Time        `json:"last_seen"`
+	CreatedAt   time.Time        `json:"created_at"`
+	Role        string           `json:"role,omitempty"`
+	Permissions *UserPermissions `json:"permissions,omitempty"`
 }
 
 type MonitoredService struct {
@@ -300,6 +301,7 @@ func initDatabase() {
 		);`,
 		`ALTER TABLE command_execution_log ADD COLUMN IF NOT EXISTS duration_ms INTEGER DEFAULT 0;`,
 		`ALTER TABLE server_members ADD COLUMN IF NOT EXISTS email VARCHAR(255) DEFAULT '';`,
+		`ALTER TABLE server_members ADD COLUMN IF NOT EXISTS permissions JSONB;`,
 	}
 	for _, q := range migrationQueries {
 		if _, err := db.Exec(q); err != nil {
@@ -588,16 +590,17 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 	var otherMembersCount int
 	_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND username != $2", serverID, username).Scan(&otherMembersCount)
 
+	// Count other admins to determine if the user is the sole admin
+	var otherAdminsCount int
+	_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND role = 'admin' AND username != $2", serverID, username).Scan(&otherAdminsCount)
+	isSoleAdmin := otherAdminsCount == 0
+
 	// If leave=true is passed, the user wants to leave the server (revoke their admin access)
 	isLeave := r.URL.Query().Get("leave") == "true"
 	// If force=true is passed, they want to completely delete it even if others are on it
 	isForce := r.URL.Query().Get("force") == "true"
 
 	if isLeave {
-		// Verify there is at least one other admin before letting this admin leave
-		var otherAdminsCount int
-		_ = db.QueryRow("SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND role = 'admin' AND username != $2", serverID, username).Scan(&otherAdminsCount)
-
 		if otherAdminsCount == 0 && otherMembersCount > 0 {
 			http.Error(w, "Conflict: You are the last remaining admin. You must promote another member to admin before leaving, or delete the server completely.", http.StatusConflict)
 			return
@@ -617,8 +620,8 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If other members exist and force is not specified, warn the admin
-	if otherMembersCount > 0 && !isForce {
+	// If other members exist and force is not specified, warn the admin (unless they are the sole admin)
+	if otherMembersCount > 0 && !isForce && !isSoleAdmin {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":       "warning_other_members",
@@ -652,10 +655,24 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Issue self-destruct teardown payload to target agent daemon
-	if sshErr == nil && sshInfo.Host != "127.0.0.1" && sshInfo.Host != "localhost" {
+	if sshErr == nil {
 		go func(info serverSSHInfo) {
 			log.Printf("[agent-teardown] Sending self-destruct signal to target agent on %s", info.Host)
-			_, _ = doAgentPostRequest(info, "uninstall", nil)
+			// 1. Try websocket uninstall first
+			_, errWS := doAgentPostRequest(info, "uninstall", nil)
+			if errWS != nil {
+				log.Printf("[agent-teardown] WebSocket uninstall failed for %s: %v. Retrying via SSH...", info.Host, errWS)
+			}
+			// 2. Fallback to SSH command execution if SSH credentials are configured
+			if info.User != "" {
+				uninstallCmd := "sudo systemctl stop cluster-target.service 2>/dev/null; sudo systemctl disable cluster-target.service 2>/dev/null; sudo rm -f /etc/systemd/system/cluster-target.service; sudo rm -rf /etc/cluster-target; sudo rm -f /usr/local/bin/cluster-target; systemctl --user stop cluster-target.service 2>/dev/null; systemctl --user disable cluster-target.service 2>/dev/null; rm -f ~/.config/systemd/user/cluster-target.service; rm -rf ~/.config/cluster-target; rm -f ~/.local/bin/cluster-target; sudo systemctl daemon-reload 2>/dev/null; systemctl --user daemon-reload 2>/dev/null; sudo pkill -9 -f cluster-target; pkill -9 -f cluster-target"
+				_, errSSH := runSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, uninstallCmd)
+				if errSSH != nil {
+					log.Printf("[agent-teardown] SSH uninstall failed for %s: %v", info.Host, errSSH)
+				} else {
+					log.Printf("[agent-teardown] SSH uninstall completed successfully for %s", info.Host)
+				}
+			}
 		}(sshInfo)
 	}
 
@@ -666,11 +683,170 @@ func handleUnregisterServer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type UserPermissions struct {
+	AllowedTabs      []string            `json:"allowed_tabs"`
+	ViewApplications []string            `json:"view_applications"`
+	ViewProcesses    []string            `json:"view_processes"`
+	ViewContainers   []string            `json:"view_containers"`
+	Containers       map[string][]string `json:"containers"`
+	CustomCommands   map[string][]string `json:"custom_commands"`
+}
+
+func (p UserPermissions) HasTabAccess(tab string) bool {
+	for _, t := range p.AllowedTabs {
+		if t == "*" || t == tab {
+			return true
+		}
+	}
+	return false
+}
+
+func (p UserPermissions) CanViewApplication(appName string) bool {
+	appName = strings.ToLower(appName)
+	for _, val := range p.ViewApplications {
+		if val == "*" || strings.ToLower(val) == appName {
+			return true
+		}
+	}
+	return false
+}
+
+func (p UserPermissions) CanViewProcess(procName string) bool {
+	procName = strings.ToLower(procName)
+	for _, val := range p.ViewProcesses {
+		if val == "*" || strings.ToLower(val) == procName {
+			return true
+		}
+	}
+	return false
+}
+
+func (p UserPermissions) CanViewContainer(containerName string) bool {
+	containerName = strings.ToLower(strings.TrimPrefix(containerName, "/"))
+	for _, val := range p.ViewContainers {
+		if val == "*" || strings.ToLower(val) == containerName {
+			return true
+		}
+	}
+	return false
+}
+
+func (p UserPermissions) CanOperateContainer(containerName string, command string) bool {
+	containerName = strings.ToLower(strings.TrimPrefix(containerName, "/"))
+	if cmds, ok := p.Containers["*"]; ok {
+		for _, cmd := range cmds {
+			if cmd == "*" || cmd == command {
+				return true
+			}
+		}
+	}
+	if cmds, ok := p.Containers[containerName]; ok {
+		for _, cmd := range cmds {
+			if cmd == "*" || cmd == command {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (p UserPermissions) CanViewCustomCommandGroup(serviceName string) bool {
+	serviceName = strings.ToLower(serviceName)
+	if _, ok := p.CustomCommands["*"]; ok {
+		return true
+	}
+	for sName := range p.CustomCommands {
+		if strings.ToLower(sName) == serviceName {
+			return true
+		}
+	}
+	return false
+}
+
+func (p UserPermissions) CanExecuteCustomCommand(serviceName string, actionKey string) bool {
+	serviceName = strings.ToLower(serviceName)
+	if actions, ok := p.CustomCommands["*"]; ok {
+		for _, act := range actions {
+			if act == "*" || act == actionKey {
+				return true
+			}
+		}
+	}
+	if actions, ok := p.CustomCommands[serviceName]; ok {
+		for _, act := range actions {
+			if act == "*" || act == actionKey {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func getEffectivePermissions(role string, permissionsBytes []byte) UserPermissions {
+	var perm UserPermissions
+	if len(permissionsBytes) > 0 && string(permissionsBytes) != "null" {
+		if err := json.Unmarshal(permissionsBytes, &perm); err == nil {
+			if len(perm.ViewContainers) == 0 {
+				perm.ViewContainers = []string{"*"}
+			}
+			return perm
+		}
+	}
+
+	// Default presets based on role
+	if role == "admin" {
+		return UserPermissions{
+			AllowedTabs:      []string{"*"},
+			ViewApplications: []string{"*"},
+			ViewProcesses:    []string{"*"},
+			ViewContainers:   []string{"*"},
+			Containers:       map[string][]string{"*": {"*"}},
+			CustomCommands:   map[string][]string{"*": {"*"}},
+		}
+	} else if role == "operator" || role == "member" {
+		return UserPermissions{
+			AllowedTabs: []string{
+				"overview", "history", "applications", "processes", "storage",
+				"containers", "systemlogs", "networks", "alerts", "commands",
+			},
+			ViewApplications: []string{"*"},
+			ViewProcesses:    []string{"*"},
+			ViewContainers:   []string{"*"},
+			Containers:       map[string][]string{"*": {"*"}},
+			CustomCommands:   map[string][]string{"*": {"*"}},
+		}
+	} else { // viewer or other
+		return UserPermissions{
+			AllowedTabs: []string{
+				"overview", "history", "applications", "processes", "storage",
+				"containers", "systemlogs", "networks", "alerts", "commands",
+			},
+			ViewApplications: []string{"*"},
+			ViewProcesses:    []string{"*"},
+			ViewContainers:   []string{"*"},
+			Containers:       map[string][]string{},
+			CustomCommands:   map[string][]string{},
+		}
+	}
+}
+
+func getUserServerPermissions(serverID string, username string) (UserPermissions, string) {
+	username = strings.ToLower(strings.TrimSpace(username))
+	var role string
+	var permissionsBytes []byte
+	err := db.QueryRow("SELECT role, permissions FROM server_members WHERE server_id = $1 AND LOWER(username) = $2", serverID, username).Scan(&role, &permissionsBytes)
+	if err != nil {
+		return getEffectivePermissions("viewer", nil), ""
+	}
+	return getEffectivePermissions(role, permissionsBytes), role
+}
+
 type MemberInfo struct {
-	Username  string    `json:"username"`
-	Role      string    `json:"role"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
+	Username    string           `json:"username"`
+	Role        string           `json:"role"`
+	Email       string           `json:"email"`
+	CreatedAt   time.Time        `json:"created_at"`
+	Permissions *UserPermissions `json:"permissions,omitempty"`
 }
 
 func handleServerMembers(w http.ResponseWriter, r *http.Request) {
@@ -700,7 +876,7 @@ func handleServerMembers(w http.ResponseWriter, r *http.Request) {
 
 	// Use DISTINCT ON to deduplicate by lowercase username — guards against any case-mismatch rows
 	rows, err := db.Query(`
-		SELECT DISTINCT ON (LOWER(username)) username, role, COALESCE(email, ''), created_at
+		SELECT DISTINCT ON (LOWER(username)) username, role, COALESCE(email, ''), created_at, permissions
 		FROM server_members
 		WHERE server_id = $1
 		ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 1 WHEN 'operator' THEN 2 WHEN 'member' THEN 3 ELSE 4 END ASC, created_at ASC
@@ -714,7 +890,10 @@ func handleServerMembers(w http.ResponseWriter, r *http.Request) {
 	members := []MemberInfo{}
 	for rows.Next() {
 		var m MemberInfo
-		if err := rows.Scan(&m.Username, &m.Role, &m.Email, &m.CreatedAt); err == nil {
+		var permissionsBytes []byte
+		if err := rows.Scan(&m.Username, &m.Role, &m.Email, &m.CreatedAt, &permissionsBytes); err == nil {
+			effPerms := getEffectivePermissions(m.Role, permissionsBytes)
+			m.Permissions = &effPerms
 			members = append(members, m)
 		}
 	}
@@ -739,9 +918,11 @@ func handleServerInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ServerID string `json:"server_id"`
-		Username string `json:"username"`
-		Role     string `json:"role"`
+		ServerID    string           `json:"server_id"`
+		Username    string           `json:"username"`
+		Usernames   []string         `json:"usernames"`
+		Role        string           `json:"role"`
+		Permissions *UserPermissions `json:"permissions"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -749,11 +930,20 @@ func handleServerInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
 	req.Role = strings.ToLower(strings.TrimSpace(req.Role))
 
-	if req.ServerID == "" || req.Username == "" || req.Role == "" {
+	if req.ServerID == "" || req.Role == "" {
 		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Wrap single username in array for compatibility
+	if req.Username != "" && len(req.Usernames) == 0 {
+		req.Usernames = []string{req.Username}
+	}
+
+	if len(req.Usernames) == 0 {
+		http.Error(w, "At least one username must be specified", http.StatusBadRequest)
 		return
 	}
 
@@ -769,14 +959,30 @@ func handleServerInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = db.Exec("INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, $3) ON CONFLICT (server_id, username) DO UPDATE SET role = $3", req.ServerID, req.Username, req.Role)
-	if err != nil {
-		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
-		return
+	var permissionsBytes []byte
+	if req.Permissions != nil {
+		permissionsBytes, _ = json.Marshal(req.Permissions)
+	}
+
+	for _, uname := range req.Usernames {
+		uname = strings.ToLower(strings.TrimSpace(uname))
+		if uname == "" {
+			continue
+		}
+		_, err = db.Exec(`
+			INSERT INTO server_members (server_id, username, role, permissions) 
+			VALUES ($1, $2, $3, $4) 
+			ON CONFLICT (server_id, username) 
+			DO UPDATE SET role = $3, permissions = $4
+		`, req.ServerID, uname, req.Role, permissionsBytes)
+		if err != nil {
+			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "User successfully invited."})
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "User(s) successfully invited."})
 }
 
 func handleServerRemove(w http.ResponseWriter, r *http.Request) {
@@ -843,9 +1049,10 @@ func handleServerRole(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ServerID string `json:"server_id"`
-		Username string `json:"username"`
-		Role     string `json:"role"`
+		ServerID    string           `json:"server_id"`
+		Username    string           `json:"username"`
+		Role        string           `json:"role"`
+		Permissions *UserPermissions `json:"permissions"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -885,9 +1092,16 @@ func handleServerRole(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err = db.Exec("UPDATE server_members SET role = $1 WHERE server_id = $2 AND username = $3", req.Role, req.ServerID, req.Username)
-	if err != nil {
-		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+	var permissionsBytes []byte
+	var dbErr error
+	if req.Permissions != nil {
+		permissionsBytes, _ = json.Marshal(req.Permissions)
+		_, dbErr = db.Exec("UPDATE server_members SET role = $1, permissions = $2 WHERE server_id = $3 AND LOWER(username) = $4", req.Role, permissionsBytes, req.ServerID, req.Username)
+	} else {
+		_, dbErr = db.Exec("UPDATE server_members SET role = $1 WHERE server_id = $2 AND LOWER(username) = $3", req.Role, req.ServerID, req.Username)
+	}
+	if dbErr != nil {
+		http.Error(w, "Database error: "+dbErr.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -1056,6 +1270,39 @@ func handleServerDetail(w http.ResponseWriter, r *http.Request) {
 		subPath = strings.TrimSuffix(subPath, "/")
 	}
 
+	// Load fine-grained permissions
+	perms, role := getUserServerPermissions(serverID, session.Username)
+
+	// Map subPath to tabName
+	var tabName string
+	switch {
+	case subPath == "metrics" || subPath == "" || subPath == "/":
+		tabName = "overview"
+	case subPath == "history":
+		tabName = "history"
+	case subPath == "containers" || subPath == "docker-info" || subPath == "container-action" || subPath == "docker-run":
+		tabName = "containers"
+	case subPath == "systemlogs":
+		tabName = "systemlogs"
+	case subPath == "networks" || subPath == "network-connections":
+		tabName = "networks"
+	case subPath == "storage":
+		tabName = "storage"
+	case subPath == "commands" || strings.HasPrefix(subPath, "commands"):
+		tabName = "commands"
+	case subPath == "processes":
+		// Allowed if either processes or applications tab is enabled
+		if role != "admin" && !perms.HasTabAccess("processes") && !perms.HasTabAccess("applications") {
+			http.Error(w, "Forbidden: You do not have permission to access processes or applications.", http.StatusForbidden)
+			return
+		}
+	}
+
+	if tabName != "" && role != "admin" && !perms.HasTabAccess(tabName) {
+		http.Error(w, fmt.Sprintf("Forbidden: You do not have permission to access the '%s' panel.", tabName), http.StatusForbidden)
+		return
+	}
+
 	// 1. Enforce Role check for subPath action/POST endpoints (Operator required)
 	if subPath == "docker-run" || subPath == "container-action" {
 		allowed, _ := checkServerPermission(serverID, session.Username, "operator")
@@ -1155,7 +1402,10 @@ func handleServerDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = db.QueryRow("SELECT role FROM server_members WHERE server_id = $1 AND LOWER(username) = LOWER($2)", s.ID, session.Username).Scan(&s.Role)
+	var permissionsBytes []byte
+	_ = db.QueryRow("SELECT role, permissions FROM server_members WHERE server_id = $1 AND LOWER(username) = LOWER($2)", s.ID, session.Username).Scan(&s.Role, &permissionsBytes)
+	effPerms := getEffectivePermissions(s.Role, permissionsBytes)
+	s.Permissions = &effPerms
 
 	// Update recently viewed log
 	db.Exec("INSERT INTO recently_viewed (server_id) VALUES ($1)", s.ID)
@@ -1186,6 +1436,13 @@ func handleServerDetail(w http.ResponseWriter, r *http.Request) {
 // Proxy function to query active processes list from remote server over SSH
 
 func handleGetProcessesProxy(w http.ResponseWriter, r *http.Request, serverID string) {
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	perms, role := getUserServerPermissions(serverID, session.Username)
+
 	info, err := loadServerSSHInfo(serverID)
 	if err == sql.ErrNoRows {
 		http.Error(w, "Server not registered", http.StatusNotFound)
@@ -1196,43 +1453,65 @@ func handleGetProcessesProxy(w http.ResponseWriter, r *http.Request, serverID st
 	}
 
 	cacheKey := "processes:" + serverID
+	var procs []map[string]interface{}
 	if val, ok := getCachedJSON(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(val))
-		return
-	}
-
-	if isDemoServer(info, serverID) {
-		mockProcs := []map[string]interface{}{
-			{"pid": "1", "name": "systemd", "user": "root", "cpu": "0.1", "mem": "12.4"},
-			{"pid": "824", "name": "alloy", "user": "alloy", "cpu": "1.2", "mem": "64.8"},
-			{"pid": "912", "name": "cluster-agent", "user": "root", "cpu": "0.5", "mem": "18.2"},
-			{"pid": "1042", "name": "postgres", "user": "postgres", "cpu": "0.8", "mem": "142.1"},
-			{"pid": "1205", "name": "nginx", "user": "nginx", "cpu": "0.2", "mem": "8.5"},
-			{"pid": "1530", "name": "go-backend", "user": "root", "cpu": "2.4", "mem": "32.0"},
-			{"pid": "2054", "name": "node_exporter", "user": "prometheus", "cpu": "0.4", "mem": "14.1"},
-			{"pid": "2100", "name": "loki", "user": "loki", "cpu": "1.5", "mem": "98.3"},
+		if err := json.Unmarshal([]byte(val), &procs); err != nil {
+			procs = nil
 		}
-		setCachedJSON(cacheKey, mockProcs, 60)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(mockProcs)
-		return
 	}
 
-	procs, err := sshGetProcesses(info)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-SSH-Unavailable", "1")
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{"error": "SSH collection unavailable", "detail": err.Error()})
-		return
+	if procs == nil {
+		if isDemoServer(info, serverID) {
+			procs = []map[string]interface{}{
+				{"pid": "1", "name": "systemd", "user": "root", "cpu": "0.1", "mem": "12.4"},
+				{"pid": "824", "name": "alloy", "user": "alloy", "cpu": "1.2", "mem": "64.8"},
+				{"pid": "912", "name": "cluster-agent", "user": "root", "cpu": "0.5", "mem": "18.2"},
+				{"pid": "1042", "name": "postgres", "user": "postgres", "cpu": "0.8", "mem": "142.1"},
+				{"pid": "1205", "name": "nginx", "user": "nginx", "cpu": "0.2", "mem": "8.5"},
+				{"pid": "1530", "name": "go-backend", "user": "root", "cpu": "2.4", "mem": "32.0"},
+				{"pid": "2054", "name": "node_exporter", "user": "prometheus", "cpu": "0.4", "mem": "14.1"},
+				{"pid": "2100", "name": "loki", "user": "loki", "cpu": "1.5", "mem": "98.3"},
+			}
+			setCachedJSON(cacheKey, procs, 60)
+		} else {
+			liveProcs, err := sshGetProcesses(info)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-SSH-Unavailable", "1")
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": "SSH collection unavailable", "detail": err.Error()})
+				return
+			}
+			procs = liveProcs
+			setCachedJSON(cacheKey, procs, 60)
+		}
 	}
-	setCachedJSON(cacheKey, procs, 60)
+
+	// Filter processes based on permissions
+	filteredProcs := []map[string]interface{}{}
+	if role == "admin" {
+		filteredProcs = procs
+	} else {
+		for _, p := range procs {
+			name := fmt.Sprintf("%v", p["name"])
+			if perms.CanViewProcess(name) || perms.CanViewApplication(name) {
+				filteredProcs = append(filteredProcs, p)
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(procs)
+	json.NewEncoder(w).Encode(filteredProcs)
 }
 
 func handleGetContainersProxy(w http.ResponseWriter, r *http.Request, serverID string) {
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	perms, role := getUserServerPermissions(serverID, session.Username)
+
 	info, err := loadServerSSHInfo(serverID)
 	if err == sql.ErrNoRows {
 		http.Error(w, "Server not registered", http.StatusNotFound)
@@ -1243,21 +1522,50 @@ func handleGetContainersProxy(w http.ResponseWriter, r *http.Request, serverID s
 	}
 
 	cacheKey := "containers:" + serverID
+	var payload map[string]interface{}
 	if val, ok := getCachedJSON(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(val))
-		return
+		if err := json.Unmarshal([]byte(val), &payload); err != nil {
+			payload = nil
+		}
 	}
 
-	payload, err := sshGetContainers(info)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-SSH-Unavailable", "1")
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Docker query failed", "detail": err.Error()})
-		return
+	if payload == nil {
+		livePayload, err := sshGetContainers(info)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-SSH-Unavailable", "1")
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Docker query failed", "detail": err.Error()})
+			return
+		}
+		payload = livePayload
+		setCachedJSON(cacheKey, payload, 60)
 	}
-	setCachedJSON(cacheKey, payload, 60)
+
+	// Filter containers based on permissions
+	if role != "admin" {
+		if rawContainers, ok := payload["containers"].([]interface{}); ok {
+			filteredContainers := []interface{}{}
+			for _, rc := range rawContainers {
+				if cMap, ok := rc.(map[string]interface{}); ok {
+					var name string
+					if n, exists := cMap["name"]; exists {
+						name = fmt.Sprintf("%v", n)
+					} else if n, exists := cMap["Names"]; exists {
+						name = fmt.Sprintf("%v", n)
+					}
+					name = strings.TrimPrefix(name, "/")
+					if perms.CanViewContainer(name) {
+						filteredContainers = append(filteredContainers, rc)
+					}
+				} else {
+					filteredContainers = append(filteredContainers, rc)
+				}
+			}
+			payload["containers"] = filteredContainers
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(payload)
 }
@@ -1282,6 +1590,36 @@ func handleContainerActionProxy(w http.ResponseWriter, r *http.Request, serverID
 		return
 	}
 
+	// Parse action/target and perform checks
+	var req struct {
+		Action    string `json:"action"`
+		Container string `json:"container"`
+		Target    string `json:"target"`
+		Dir       string `json:"dir"`
+		Image     string `json:"image"`
+	}
+	if jErr := json.Unmarshal(body, &req); jErr != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	containerName := req.Container
+	if containerName == "" {
+		containerName = req.Target
+	}
+
+	session, errSession := getSession(r)
+	if errSession != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	perms, role := getUserServerPermissions(serverID, session.Username)
+	if role != "admin" && !perms.CanOperateContainer(containerName, req.Action) {
+		http.Error(w, fmt.Sprintf("Forbidden: You do not have permission to execute container action '%s' on '%s'.", req.Action, containerName), http.StatusForbidden)
+		return
+	}
+
 	// 1. Try direct HTTP to the target agent (/api/v1/container-action)
 	if agentResp, dErr := doAgentPostRequest(info, "container-action", body); dErr == nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1290,16 +1628,6 @@ func handleContainerActionProxy(w http.ResponseWriter, r *http.Request, serverID
 	}
 
 	// 2. SSH fallback — parse action/target and run docker directly on the remote host
-	var req struct {
-		Action string `json:"action"`
-		Target string `json:"target"`
-		Dir    string `json:"dir"`
-		Image  string `json:"image"`
-	}
-	if jErr := json.Unmarshal(body, &req); jErr != nil {
-		http.Error(w, "Bad request", http.StatusBadRequest)
-		return
-	}
 
 	var dockerCmd string
 	switch req.Action {
@@ -2156,7 +2484,10 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			rules = append(rules, rule)
+			perms, role := getUserServerPermissions(rule.ServerID, username)
+			if role == "admin" || perms.HasTabAccess("alerts") {
+				rules = append(rules, rule)
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(rules)
@@ -2204,8 +2535,9 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Enforce Operator permission
-		allowed, _ := checkServerPermission(rule.ServerID, username, "operator")
-		if !allowed {
+		allowed, role := checkServerPermission(rule.ServerID, username, "operator")
+		perms, _ := getUserServerPermissions(rule.ServerID, username)
+		if !allowed || (role != "admin" && !perms.HasTabAccess("alerts")) {
 			http.Error(w, "Forbidden: You do not have permission to manage alert rules on this server.", http.StatusForbidden)
 			return
 		}
@@ -2254,8 +2586,9 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		allowed, _ := checkServerPermission(serverID, username, "operator")
-		if !allowed {
+		allowed, role := checkServerPermission(serverID, username, "operator")
+		perms, _ := getUserServerPermissions(serverID, username)
+		if !allowed || (role != "admin" && !perms.HasTabAccess("alerts")) {
 			http.Error(w, "Forbidden: You do not have permission to manage alert rules on this server.", http.StatusForbidden)
 			return
 		}
@@ -2303,16 +2636,18 @@ func handleAlertRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		allowed, _ := checkServerPermission(existingServerID, username, "operator")
-		if !allowed {
+		allowed, role := checkServerPermission(existingServerID, username, "operator")
+		perms, _ := getUserServerPermissions(existingServerID, username)
+		if !allowed || (role != "admin" && !perms.HasTabAccess("alerts")) {
 			http.Error(w, "Forbidden: You do not have permission to manage alert rules on this server.", http.StatusForbidden)
 			return
 		}
 
 		// Also check permission on new server ID if it's changing
-		if rule.ServerID != existingServerID {
-			allowed, _ = checkServerPermission(rule.ServerID, username, "operator")
-			if !allowed {
+		if rule.ServerID != "" && rule.ServerID != existingServerID {
+			allowedNew, roleNew := checkServerPermission(rule.ServerID, username, "operator")
+			permsNew, _ := getUserServerPermissions(rule.ServerID, username)
+			if !allowedNew || (roleNew != "admin" && !permsNew.HasTabAccess("alerts")) {
 				http.Error(w, "Forbidden: You do not have permission to manage alert rules on the target server.", http.StatusForbidden)
 				return
 			}
@@ -2410,12 +2745,15 @@ func handleServerCommands(w http.ResponseWriter, r *http.Request, serverID strin
 			}
 			defer rows.Close()
 			sets := []CustomCommandSet{}
+			perms, role := getUserServerPermissions(serverID, username)
 			for rows.Next() {
 				var s CustomCommandSet
 				var cmdsBytes []byte
 				if err := rows.Scan(&s.ID, &s.ServerID, &s.ServiceName, &cmdsBytes, &s.CreatedBy, &s.UpdatedAt); err == nil {
 					json.Unmarshal(cmdsBytes, &s.Commands)
-					sets = append(sets, s)
+					if role == "admin" || perms.CanViewCustomCommandGroup(s.ServiceName) {
+						sets = append(sets, s)
+					}
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -2485,7 +2823,7 @@ func handleServerCommands(w http.ResponseWriter, r *http.Request, serverID strin
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		allowed, _ := checkServerPermission(serverID, username, "operator")
+		allowed, role := checkServerPermission(serverID, username, "operator")
 		if !allowed {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
@@ -2496,6 +2834,11 @@ func handleServerCommands(w http.ResponseWriter, r *http.Request, serverID strin
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		perms, _ := getUserServerPermissions(serverID, username)
+		if role != "admin" && !perms.CanExecuteCustomCommand(payload.ServiceName, payload.CommandType) {
+			http.Error(w, fmt.Sprintf("Forbidden: You do not have permission to execute custom command '%s' on service '%s'.", payload.CommandType, payload.ServiceName), http.StatusForbidden)
 			return
 		}
 		if payload.ServiceName == "" || payload.CommandType == "" {
@@ -2652,7 +2995,6 @@ func pruneOldMetrics() {
 		}
 	}
 }
-
 
 func convertToFloat(val interface{}) float64 {
 	if val == nil {

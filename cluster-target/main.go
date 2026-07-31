@@ -100,7 +100,13 @@ func handleUninstall(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		log.Println("[uninstall] Self-destruct teardown payload received. Cleaning up daemon...")
-		cmd := exec.Command("sh", "-c", "sudo systemctl stop cluster-target.service 2>/dev/null; sudo systemctl disable cluster-target.service 2>/dev/null; sudo rm -f /etc/systemd/system/cluster-target.service; sudo systemctl daemon-reload 2>/dev/null; sudo rm -rf /etc/cluster-target; sudo pkill -9 -f cluster-target; sudo rm -f /usr/local/bin/cluster-target")
+		var cmdStr string
+		if os.Getuid() == 0 {
+			cmdStr = "systemctl stop cluster-target.service 2>/dev/null; systemctl disable cluster-target.service 2>/dev/null; rm -f /etc/systemd/system/cluster-target.service; systemctl daemon-reload 2>/dev/null; rm -rf /etc/cluster-target; rm -f /usr/local/bin/cluster-target; pkill -9 -f cluster-target"
+		} else {
+			cmdStr = "systemctl --user stop cluster-target.service 2>/dev/null; systemctl --user disable cluster-target.service 2>/dev/null; rm -f ~/.config/systemd/user/cluster-target.service; systemctl --user daemon-reload 2>/dev/null; rm -rf ~/.config/cluster-target; rm -f ~/.local/bin/cluster-target; pkill -9 -f cluster-target"
+		}
+		cmd := exec.Command("sh", "-c", cmdStr)
 		_ = cmd.Run()
 		os.Exit(0)
 	}()

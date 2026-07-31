@@ -344,7 +344,39 @@ async function openServerDetails(serverId) {
         const procListBody = document.getElementById('proc-list-body');
         if (procListBody) procListBody.innerHTML = '<tr><td colspan="13" style="text-align:center; padding:15px; opacity:0.5;">Loading process list...</td></tr>';
 
-        switchTab('resources-tab');
+        const tabMappings = {
+            'resources-tab': 'overview',
+            'history-tab': 'history',
+            'services-tab': 'applications',
+            'processes-tab': 'processes',
+            'filesystems-tab': 'storage',
+            'containers-tab': 'containers',
+            'logs-tab': 'systemlogs',
+            'networks-tab': 'networks',
+            'alerts-tab': 'alerts',
+            'commands-tab': 'commands'
+        };
+
+        let firstAllowedTabId = null;
+        Object.entries(tabMappings).forEach(([tabId, permName]) => {
+            const btn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
+            if (btn) {
+                const isAllowed = server.role === 'admin' || 
+                    (server.permissions && server.permissions.allowed_tabs && 
+                     (server.permissions.allowed_tabs.includes('*') || server.permissions.allowed_tabs.includes(permName)));
+                
+                if (isAllowed) {
+                    btn.style.display = 'block';
+                    if (!firstAllowedTabId) firstAllowedTabId = tabId;
+                } else {
+                    btn.style.display = 'none';
+                }
+            }
+        });
+
+        if (firstAllowedTabId) {
+            switchTab(firstAllowedTabId);
+        }
 
         setTimeout(() => {
             if (currentActiveServer !== serverId) return;
@@ -2647,29 +2679,437 @@ document.addEventListener('DOMContentLoaded', () => {
 // SERVER TEAM ACCESS MANAGEMENT
 let currentTeamServerId = null;
 
-function openTeamModal(serverId, hostname) {
+let teamUsernames = new Set();
+let teamCurrentRole = 'viewer';
+let teamEditMode = false;
+let teamEditingUsername = null;
+let teamServerMembers = [];
+
+function focusTeamTagsInput() {
+    if (teamEditMode) return;
+    const inp = document.getElementById('team-tags-input');
+    if (inp) inp.focus();
+}
+
+function renderTeamTags() {
+    const list = document.getElementById('team-tags-list');
+    if (!list) return;
+    list.innerHTML = '';
+    teamUsernames.forEach(name => {
+        const tag = document.createElement('div');
+        tag.className = 'tag';
+        tag.innerHTML = `
+            <img src="https://github.com/${name}.png?size=32" onerror="this.src='https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png'">
+            <span>${name}</span>
+            <span class="tag-remove" onclick="removeTeamTag('${name}')"><i class="fa-solid fa-xmark"></i></span>
+        `;
+        list.appendChild(tag);
+    });
+    updateTeamSubmitButtonText();
+}
+
+function addTeamTag(name) {
+    if (teamEditMode) return;
+    name = name.trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
+    if (name && !teamUsernames.has(name)) {
+        teamUsernames.add(name);
+        renderTeamTags();
+    }
+    const inp = document.getElementById('team-tags-input');
+    if (inp) inp.value = '';
+}
+
+function removeTeamTag(name) {
+    if (teamEditMode) return;
+    teamUsernames.delete(name);
+    renderTeamTags();
+}
+
+// Hook tag input element listeners
+function setupTeamTagsListeners() {
+    const inp = document.getElementById('team-tags-input');
+    if (!inp) return;
+
+    // Clear previous event listeners by cloning
+    const newInp = inp.cloneNode(true);
+    inp.parentNode.replaceChild(newInp, inp);
+
+    newInp.addEventListener('keydown', (e) => {
+        if (teamEditMode) return;
+        if (e.key === 'Enter' || e.key === ',') {
+            e.preventDefault();
+            addTeamTag(newInp.value);
+        } else if (e.key === 'Backspace' && newInp.value === '' && teamUsernames.size > 0) {
+            const arr = Array.from(teamUsernames);
+            teamUsernames.delete(arr[arr.length - 1]);
+            renderTeamTags();
+        }
+    });
+
+    newInp.addEventListener('blur', () => {
+        if (teamEditMode) return;
+        if (newInp.value.trim()) {
+            addTeamTag(newInp.value);
+        }
+    });
+
+    newInp.addEventListener('input', () => {
+        if (teamEditMode) return;
+        if (newInp.value.includes(' ')) {
+            const parts = newInp.value.split(/[\s,]+/);
+            parts.forEach(part => addTeamTag(part));
+        }
+    });
+}
+
+function selectTeamRole(role) {
+    document.querySelectorAll('#team-modal .role-option').forEach(el => el.classList.remove('selected'));
+    const target = document.getElementById(`preset-${role}`);
+    if (target) target.classList.add('selected');
+    teamCurrentRole = role;
+
+    const tsecTabs = document.getElementById('tsec-tabs');
+    const tsecApps = document.getElementById('tsec-applications');
+    const tsecProcs = document.getElementById('tsec-processes');
+    const tsecConts = document.getElementById('tsec-containers');
+    const tsecCmds = document.getElementById('tsec-commands');
+    const tsecAlerts = document.getElementById('tsec-alerts');
+
+    const tcbManageAlerts = document.getElementById('tcb-manage-alerts');
+
+    if (role === 'admin') {
+        tsecTabs.classList.add('disabled');
+        tsecApps.classList.add('disabled');
+        tsecProcs.classList.add('disabled');
+        tsecConts.classList.add('disabled');
+        tsecCmds.classList.add('disabled');
+        tsecAlerts.classList.add('disabled');
+
+        // Check all tabs in UI
+        document.querySelectorAll('#team-modal input[id^="tcb-"]').forEach(input => {
+            input.checked = true;
+            input.parentElement.classList.add('active');
+        });
+
+        document.getElementById('tcb-all-apps').checked = true;
+        document.getElementById('tcb-all-procs').checked = true;
+        document.getElementById('tcb-all-conts').checked = true;
+        if (tcbManageAlerts) tcbManageAlerts.checked = true;
+        document.getElementById('team-custom-apps-group').style.display = 'none';
+        document.getElementById('team-custom-procs-group').style.display = 'none';
+
+        // Admin checks all container visibility and actions
+        document.querySelectorAll('.container-vis-cb, .container-ops-grid input').forEach(input => {
+            input.checked = true;
+        });
+        document.querySelectorAll('.container-ops-grid').forEach(grid => grid.style.display = 'none');
+    } else {
+        tsecTabs.classList.remove('disabled');
+        
+        // Restore tabs checkboxes states in UI
+        document.querySelectorAll('#team-modal input[id^="tcb-"]').forEach(input => {
+            if (input.checked) {
+                input.parentElement.classList.add('active');
+            } else {
+                input.parentElement.classList.remove('active');
+            }
+        });
+
+        syncTeamSectionsVisibility();
+
+        // Hide/Show command elements based on viewer vs operator
+        if (role === 'viewer') {
+            document.querySelectorAll('.container-ops-grid').forEach(grid => grid.style.display = 'none');
+            tsecCmds.classList.add('disabled');
+            tsecCmds.classList.remove('open');
+            const cmdContent = tsecCmds.querySelector('.accordion-content');
+            if (cmdContent) cmdContent.style.display = 'none';
+
+            if (tcbManageAlerts) tcbManageAlerts.checked = false;
+            if (tsecAlerts) {
+                tsecAlerts.classList.add('disabled');
+                tsecAlerts.classList.remove('open');
+                const alertsContent = tsecAlerts.querySelector('.accordion-content');
+                if (alertsContent) alertsContent.style.display = 'none';
+            }
+        } else { // operator
+            // Show command grids for checked containers
+            document.querySelectorAll('.container-vis-cb').forEach(cb => {
+                const grid = document.getElementById(`ops-for-${cb.value}`);
+                if (grid) {
+                    grid.style.display = cb.checked ? 'grid' : 'none';
+                }
+            });
+
+            const cmdTabEnabled = document.getElementById('tcb-commands').checked;
+            toggleTeamSectionState('tsec-commands', cmdTabEnabled);
+
+            const alertsTabEnabled = document.getElementById('tcb-alerts').checked;
+            toggleTeamSectionState('tsec-alerts', alertsTabEnabled);
+            if (tcbManageAlerts) tcbManageAlerts.checked = true;
+        }
+    }
+}
+
+function toggleTeamTabSetting(tabId) {
+    const cb = document.getElementById(`tcb-${tabId}`);
+    if (!cb) return;
+    const label = cb.parentElement;
+    if (cb.checked) {
+        label.classList.add('active');
+    } else {
+        label.classList.remove('active');
+    }
+    syncTeamSectionsVisibility();
+}
+
+function syncTeamSectionsVisibility() {
+    if (teamCurrentRole === 'admin') return;
+
+    const appEnabled = document.getElementById('tcb-applications').checked;
+    const procEnabled = document.getElementById('tcb-processes').checked;
+    const contEnabled = document.getElementById('tcb-containers').checked;
+    const cmdEnabled = document.getElementById('tcb-commands').checked;
+    const alertsEnabled = document.getElementById('tcb-alerts').checked;
+
+    toggleTeamSectionState('tsec-applications', appEnabled);
+    toggleTeamSectionState('tsec-processes', procEnabled);
+    toggleTeamSectionState('tsec-containers', contEnabled);
+    toggleTeamSectionState('tsec-commands', cmdEnabled);
+    toggleTeamSectionState('tsec-alerts', alertsEnabled);
+}
+
+function toggleTeamSectionState(id, isEnabled) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (isEnabled) {
+        el.classList.remove('disabled');
+    } else {
+        el.classList.add('disabled');
+        el.classList.remove('open');
+        const content = el.querySelector('.accordion-content');
+        if (content) content.style.display = 'none';
+    }
+}
+
+function toggleTeamAccordion(id) {
+    const el = document.getElementById(id);
+    if (!el || el.classList.contains('disabled')) return;
+    
+    const content = el.querySelector('.accordion-content');
+    if (!content) return;
+
+    if (el.classList.contains('open')) {
+        el.classList.remove('open');
+        content.style.display = 'none';
+    } else {
+        el.classList.add('open');
+        content.style.display = 'flex';
+    }
+}
+
+function toggleTeamAllAppsState() {
+    const isAll = document.getElementById('tcb-all-apps').checked;
+    const group = document.getElementById('team-custom-apps-group');
+    if (isAll) {
+        group.style.display = 'none';
+    } else {
+        group.style.display = 'flex';
+        document.getElementById('team-custom-apps-input').focus();
+    }
+}
+
+function toggleTeamAllProcsState() {
+    const isAll = document.getElementById('tcb-all-procs').checked;
+    const group = document.getElementById('team-custom-procs-group');
+    if (isAll) {
+        group.style.display = 'none';
+    } else {
+        group.style.display = 'flex';
+        document.getElementById('team-custom-procs-input').focus();
+    }
+}
+
+function toggleTeamAllContsState() {
+    const isAll = document.getElementById('tcb-all-conts').checked;
+    document.querySelectorAll('.container-vis-cb').forEach(cb => {
+        cb.checked = isAll;
+        toggleContainerRowOps(cb.value, isAll);
+    });
+}
+
+function toggleContainerRowOps(name, isChecked) {
+    const grid = document.getElementById(`ops-for-${name}`);
+    if (grid) {
+        if (isChecked && teamCurrentRole === 'operator') {
+            grid.style.display = 'grid';
+        } else {
+            grid.style.display = 'none';
+        }
+    }
+    const wrapper = document.getElementById(`ops-for-${name}`);
+    if (wrapper) {
+        wrapper.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.checked = isChecked;
+        });
+    }
+    if (!isChecked) {
+        document.getElementById('tcb-all-conts').checked = false;
+    } else {
+        const total = document.querySelectorAll('.container-vis-cb').length;
+        const checked = document.querySelectorAll('.container-vis-cb:checked').length;
+        if (total > 0 && total === checked) {
+            document.getElementById('tcb-all-conts').checked = true;
+        }
+    }
+}
+
+function updateTeamSubmitButtonText() {
+    const btn = document.getElementById('team-submit-btn');
+    if (!btn) return;
+
+    if (teamEditMode) {
+        btn.innerHTML = `<i class="fa-solid fa-save"></i> Save Permissions`;
+    } else {
+        if (teamUsernames.size === 1) {
+            btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> Send Invite`;
+        } else {
+            btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> Send Bulk Invites`;
+        }
+    }
+}
+
+async function openTeamModal(serverId, hostname) {
     currentTeamServerId = serverId;
-    
+    teamEditMode = false;
+    teamEditingUsername = null;
+    teamUsernames.clear();
+
     const serverIdEl = document.getElementById('team-server-id');
-    const userEl = document.getElementById('team-invite-username');
-    const roleEl = document.getElementById('team-invite-role');
-    
     if (serverIdEl) serverIdEl.value = serverId;
-    if (userEl) userEl.value = '';
-    if (roleEl) roleEl.value = 'viewer';
-    
+
     const modalTitle = document.querySelector('#team-modal .modal-header h3');
     if (modalTitle) {
-        modalTitle.innerHTML = `<i class="fa-solid fa-users-gear"></i> Access &amp; Team Settings - ${hostname}`;
+        modalTitle.innerHTML = `<i class="fa-solid fa-users-gear"></i> Server Access &amp; Team Settings - ${hostname}`;
     }
+
+    // Reset elements views
+    document.getElementById('team-invite-title').textContent = "Invite Team Member";
+    document.getElementById('team-usernames-group').style.display = 'flex';
+    document.getElementById('team-user-edit-group').style.display = 'none';
+    document.getElementById('team-tags-input').value = '';
+    
+    // Check all tab checkmarks by default
+    document.querySelectorAll('#team-modal input[id^="tcb-"]').forEach(cb => {
+        cb.checked = true;
+        cb.parentElement.classList.add('active');
+    });
+
+    document.getElementById('tcb-all-apps').checked = true;
+    document.getElementById('tcb-all-procs').checked = true;
+    document.getElementById('tcb-all-conts').checked = true;
+    const tcbManageAlerts = document.getElementById('tcb-manage-alerts');
+    if (tcbManageAlerts) tcbManageAlerts.checked = true;
+    document.getElementById('team-custom-apps-group').style.display = 'none';
+    document.getElementById('team-custom-procs-group').style.display = 'none';
+    document.getElementById('team-custom-apps-input').value = '';
+    document.getElementById('team-custom-procs-input').value = '';
+
+    // Fetch active Docker containers dynamically
+    const containersContainer = document.getElementById('team-containers-configs');
+    containersContainer.innerHTML = `<div style="font-size:11px; opacity:0.5; padding:5px;"><i class="fa-solid fa-spinner fa-spin"></i> Fetching containers...</div>`;
+    
+    // Fetch custom commands dynamically
+    const commandsContainer = document.getElementById('team-commands-configs');
+    commandsContainer.innerHTML = `<div style="font-size:11px; opacity:0.5; padding:5px;"><i class="fa-solid fa-spinner fa-spin"></i> Fetching commands...</div>`;
 
     const modal = document.getElementById('team-modal');
     if (modal) {
         modal.style.display = 'flex';
         modal.classList.add('open');
     }
-    
+
+    setupTeamTagsListeners();
+    renderTeamTags();
+    selectTeamRole('viewer');
+
     loadServerMembers(serverId);
+
+    // Dynamic loads
+    let containersList = [];
+    try {
+        const resp = await fetch(`/api/servers/detail/${serverId}/containers`);
+        if (resp.ok) {
+            const data = await resp.json();
+            containersList = data.containers || [];
+        }
+    } catch (e) { console.error(e); }
+
+    containersContainer.innerHTML = '';
+    if (containersList.length === 0) {
+        containersContainer.innerHTML = `<p style="font-size:11px; color:var(--text-faint);">No active Docker containers found on this server.</p>`;
+    } else {
+        containersList.forEach(c => {
+            const cName = c.name || (c.Names && c.Names[0]) || '';
+            const name = cName.replace(/^\//, '');
+            if (!name) return;
+
+            const card = document.createElement('div');
+            card.className = 'config-group-card';
+            card.setAttribute('data-container', name);
+            card.innerHTML = `
+                <div class="config-group-title" style="display: flex; align-items: center; justify-content: space-between;">
+                    <label style="display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; font-size: 13px;">
+                        <input type="checkbox" class="container-vis-cb" value="${name}" checked onchange="toggleContainerRowOps('${name}', this.checked)">
+                        <i class="fa-solid fa-cube" style="color: var(--primary);"></i> ${name}
+                    </label>
+                </div>
+                <div class="container-ops-grid checkboxes-grid" id="ops-for-${name}" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.05);">
+                    <label class="checkbox-label"><input type="checkbox" value="start" checked> start</label>
+                    <label class="checkbox-label"><input type="checkbox" value="stop" checked> stop</label>
+                    <label class="checkbox-label"><input type="checkbox" value="pause" checked> pause</label>
+                    <label class="checkbox-label"><input type="checkbox" value="unpause" checked> unpause</label>
+                    <label class="checkbox-label"><input type="checkbox" value="restart" checked> restart</label>
+                    <label class="checkbox-label"><input type="checkbox" value="logs" checked> logs</label>
+                </div>
+            `;
+            containersContainer.appendChild(card);
+        });
+    }
+
+    let commandSets = [];
+    try {
+        const resp = await fetch(`/api/servers/detail/${serverId}/commands`);
+        if (resp.ok) {
+            commandSets = await resp.json();
+        }
+    } catch (e) { console.error(e); }
+
+    commandsContainer.innerHTML = '';
+    if (commandSets.length === 0) {
+        commandsContainer.innerHTML = `<p style="font-size:11px; color:var(--text-faint);">No custom commands registered on this server.</p>`;
+    } else {
+        commandSets.forEach(set => {
+            const name = set.service_name;
+            const actions = Object.keys(set.commands || {});
+            if (actions.length === 0) return;
+
+            const card = document.createElement('div');
+            card.className = 'config-group-card';
+            card.setAttribute('data-service', name);
+
+            let checkboxesHtml = '';
+            actions.forEach(act => {
+                checkboxesHtml += `<label class="checkbox-label"><input type="checkbox" value="${act}" checked> ${act}</label>`;
+            });
+
+            card.innerHTML = `
+                <div class="config-group-title"><i class="fa-solid fa-folder-tree"></i> ${name} Group</div>
+                <div class="checkboxes-grid">${checkboxesHtml}</div>
+            `;
+            commandsContainer.appendChild(card);
+        });
+    }
 }
 
 function closeTeamModal() {
@@ -2684,17 +3124,14 @@ function closeTeamModal() {
 async function loadServerMembers(serverId) {
     try {
         const resp = await fetch(`/api/servers/members?id=${serverId}`);
-        if (!resp.ok) {
-            console.error("Failed to load server members");
-            return;
-        }
+        if (!resp.ok) return;
         const data = await resp.json();
         const members = data.members || [];
         const currentUserRole = data.current_user_role || 'viewer';
 
         const inviteSection = document.getElementById('team-invite-section');
         if (inviteSection) {
-            inviteSection.style.display = currentUserRole === 'admin' ? 'block' : 'none';
+            inviteSection.style.display = currentUserRole === 'admin' ? 'flex' : 'none';
         }
 
         const listContainer = document.getElementById('team-members-list');
@@ -2706,8 +3143,6 @@ async function loadServerMembers(serverId) {
             return;
         }
 
-        // Deduplicate case-insensitively (guards against DB having both 'DevAyyan' and 'devayyan')
-        // Keep the admin/highest-role entry when there are duplicates
         const seen = new Set();
         const uniqueMembers = members.filter(m => {
             const key = m.username.toLowerCase();
@@ -2715,6 +3150,9 @@ async function loadServerMembers(serverId) {
             seen.add(key);
             return true;
         });
+
+        // Save unique members for configuration editing
+        teamServerMembers = uniqueMembers;
 
         uniqueMembers.forEach(m => {
             const isSelf = m.username.toLowerCase() === (window.currentUserUsername || '').toLowerCase();
@@ -2731,30 +3169,19 @@ async function loadServerMembers(serverId) {
 
             const avatarUrl = `https://github.com/${m.username}.png?size=40`;
 
-            let roleControlHtml = '';
+            let actionControlsHtml = '';
             if (currentUserRole === 'admin' && !isSelf) {
-                // Admin can change other members' roles, but not their own (prevents self-demotion)
-                roleControlHtml = `
-                    <select onchange="updateMemberRole('${serverId}', '${m.username}', this.value)" style="background: var(--bg-card); border: 1px solid var(--border-color); color: var(--text-primary); font-size: 12px; padding: 4px 8px; border-radius: 4px; font-weight: 600;">
-                        <option value="viewer" ${m.role === 'viewer' ? 'selected' : ''}>Viewer</option>
-                        <option value="operator" ${m.role === 'operator' || m.role === 'member' ? 'selected' : ''}>Operator</option>
-                        <option value="admin" ${m.role === 'admin' ? 'selected' : ''}>Admin</option>
-                    </select>
-                `;
-            } else {
-                // Show role as a badge — can't change own role
-                const roleLabel = m.role === 'member' ? 'operator' : m.role;
-                roleControlHtml = `<span style="font-size: 11px; font-weight: 700; color: var(--text-secondary); background: rgba(255,255,255,0.06); padding: 3px 6px; border-radius: 4px; text-transform: uppercase; border: 1px solid var(--border-color);">${roleLabel}</span>`;
-            }
-
-            // Only admins can remove OTHER members. Never show a remove/leave button for yourself.
-            let removeButtonHtml = '';
-            if (currentUserRole === 'admin' && !isSelf) {
-                removeButtonHtml = `
-                    <button onclick="removeServerMember('${serverId}', '${m.username}', false)" style="background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); color: #f87171; cursor: pointer; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; transition: all 0.2s;" onmouseover="this.style.background='rgba(239, 68, 68, 0.15)'" onmouseout="this.style.background='rgba(239, 68, 68, 0.08)'">
+                actionControlsHtml = `
+                    <button onclick="editTeamMemberPermissions('${m.username}')" style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); color: var(--primary); cursor: pointer; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 4px; transition: all 0.15s;" onmouseover="this.style.background='rgba(56,189,248,0.15)'" onmouseout="this.style.background='rgba(56,189,248,0.08)'">
+                        <i class="fa-solid fa-user-gear"></i> Configure
+                    </button>
+                    <button onclick="removeServerMember('${serverId}', '${m.username}', false)" style="background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); color: #f87171; cursor: pointer; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; transition: all 0.15s;" onmouseover="this.style.background='rgba(239,68,68,0.15)'" onmouseout="this.style.background='rgba(239,68,68,0.08)'">
                         Remove
                     </button>
                 `;
+            } else {
+                const roleLabel = m.role === 'member' ? 'operator' : m.role;
+                actionControlsHtml = `<span style="font-size: 11px; font-weight: 700; color: var(--text-secondary); background: rgba(255,255,255,0.06); padding: 3px 6px; border-radius: 4px; text-transform: uppercase; border: 1px solid var(--border-color);">${roleLabel}</span>`;
             }
 
             div.innerHTML = `
@@ -2765,8 +3192,7 @@ async function loadServerMembers(serverId) {
                     </div>
                 </div>
                 <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
-                    ${roleControlHtml}
-                    ${removeButtonHtml}
+                    ${actionControlsHtml}
                 </div>
             `;
             listContainer.appendChild(div);
@@ -2777,48 +3203,270 @@ async function loadServerMembers(serverId) {
     }
 }
 
-async function handleTeamInvite(e) {
-    e.preventDefault();
-    const serverId = document.getElementById('team-server-id').value;
-    const username = document.getElementById('team-invite-username').value.trim();
-    const role = document.getElementById('team-invite-role').value;
+function editTeamMemberPermissions(username) {
+    const member = teamServerMembers.find(m => m.username.toLowerCase() === username.toLowerCase());
+    if (!member) return;
 
-    if (!serverId || !username) return;
+    teamEditMode = true;
+    teamEditingUsername = username;
 
-    try {
-        const resp = await fetch('/api/servers/members/invite', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ server_id: serverId, username, role })
-        });
-        const res = await resp.json();
-        if (resp.ok) {
-            document.getElementById('team-invite-username').value = '';
-            loadServerMembers(serverId);
+    // Update Header
+    document.getElementById('team-invite-title').textContent = "Modify Member Permissions";
+    document.getElementById('team-usernames-group').style.display = 'none';
+    document.getElementById('team-user-edit-group').style.display = 'flex';
+    document.getElementById('team-edit-username').textContent = username;
+    document.getElementById('team-edit-avatar').src = `https://github.com/${username}.png?size=40`;
+
+    // Set Role Select
+    selectTeamRole(member.role);
+
+    // Prepopulate permissions
+    const perms = member.permissions || {};
+    const allowedTabs = perms.allowed_tabs || [];
+
+    // Prepopulate Tab Checkboxes
+    document.querySelectorAll('#team-modal input[id^="tcb-"]').forEach(cb => {
+        const tabId = cb.id.replace('tcb-', '');
+        cb.checked = member.role === 'admin' || allowedTabs.includes('*') || allowedTabs.includes(tabId);
+        if (cb.checked) {
+            cb.parentElement.classList.add('active');
         } else {
-            alert(res.message || "Failed to invite member.");
+            cb.parentElement.classList.remove('active');
         }
-    } catch (e) {
-        console.error("Error inviting member:", e);
+    });
+
+    // Apps & Processes Visibility
+    const viewApps = perms.view_applications || ['*'];
+    const viewProcs = perms.view_processes || ['*'];
+    const viewConts = perms.view_containers || ['*'];
+    const manageAlerts = perms.manage_alerts !== false;
+
+    const isAllApps = viewApps.includes('*');
+    document.getElementById('tcb-all-apps').checked = isAllApps;
+    const appsGroup = document.getElementById('team-custom-apps-group');
+    if (isAllApps) {
+        appsGroup.style.display = 'none';
+        document.getElementById('team-custom-apps-input').value = '';
+    } else {
+        appsGroup.style.display = 'flex';
+        document.getElementById('team-custom-apps-input').value = viewApps.join(', ');
     }
+
+    const isAllProcs = viewProcs.includes('*');
+    document.getElementById('tcb-all-procs').checked = isAllProcs;
+    const procsGroup = document.getElementById('team-custom-procs-group');
+    if (isAllProcs) {
+        procsGroup.style.display = 'none';
+        document.getElementById('team-custom-procs-input').value = '';
+    } else {
+        procsGroup.style.display = 'flex';
+        document.getElementById('team-custom-procs-input').value = viewProcs.join(', ');
+    }
+
+    const isAllConts = viewConts.includes('*');
+    document.getElementById('tcb-all-conts').checked = isAllConts;
+    document.querySelectorAll('.container-vis-cb').forEach(visCb => {
+        const cName = visCb.value;
+        const isVisible = isAllConts || viewConts.includes(cName);
+        visCb.checked = isVisible;
+        toggleContainerRowOps(cName, isVisible);
+    });
+
+    const tcbManageAlerts = document.getElementById('tcb-manage-alerts');
+    if (tcbManageAlerts) tcbManageAlerts.checked = manageAlerts;
+
+    // Container checkboxes
+    const contPerms = perms.containers || {};
+    document.querySelectorAll('#team-containers-configs .config-group-card').forEach(card => {
+        const cName = card.getAttribute('data-container');
+        const allowedCmds = contPerms[cName] || contPerms['*'] || [];
+        const allowAll = allowedCmds.includes('*');
+
+        card.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.checked = member.role === 'admin' || allowAll || allowedCmds.includes(cb.value);
+        });
+    });
+
+    // Custom commands checkboxes
+    const cmdPerms = perms.custom_commands || {};
+    document.querySelectorAll('#team-commands-configs .config-group-card').forEach(card => {
+        const sName = card.getAttribute('data-service');
+        const allowedActs = cmdPerms[sName] || cmdPerms['*'] || [];
+        const allowAll = allowedActs.includes('*');
+
+        card.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.checked = member.role === 'admin' || allowAll || allowedActs.includes(cb.value);
+        });
+    });
+
+    syncTeamSectionsVisibility();
+    updateTeamSubmitButtonText();
 }
 
-async function updateMemberRole(serverId, username, newRole) {
-    try {
-        const resp = await fetch('/api/servers/members/role', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ server_id: serverId, username, role: newRole })
-        });
-        const res = await resp.json();
-        if (!resp.ok) {
-            alert(res.message || "Failed to update role.");
-            loadServerMembers(serverId);
-        } else {
-            loadServerMembers(serverId);
+function exitTeamEditMode() {
+    teamEditMode = false;
+    teamEditingUsername = null;
+
+    document.getElementById('team-invite-title').textContent = "Invite Team Member";
+    document.getElementById('team-usernames-group').style.display = 'flex';
+    document.getElementById('team-user-edit-group').style.display = 'none';
+
+    // Reset fields
+    document.querySelectorAll('#team-modal input[id^="tcb-"]').forEach(cb => {
+        cb.checked = true;
+        cb.parentElement.classList.add('active');
+    });
+
+    document.getElementById('tcb-all-apps').checked = true;
+    document.getElementById('tcb-all-procs').checked = true;
+    document.getElementById('tcb-all-conts').checked = true;
+    const tcbManageAlerts = document.getElementById('tcb-manage-alerts');
+    if (tcbManageAlerts) tcbManageAlerts.checked = true;
+
+    document.getElementById('team-custom-apps-group').style.display = 'none';
+    document.getElementById('team-custom-procs-group').style.display = 'none';
+    document.getElementById('team-custom-apps-input').value = '';
+    document.getElementById('team-custom-procs-input').value = '';
+
+    // Set checkboxes to checked
+    document.querySelectorAll('#team-containers-configs input, #team-commands-configs input').forEach(input => {
+        input.checked = true;
+    });
+
+    selectTeamRole('viewer');
+    renderTeamTags();
+}
+
+function compilePermissionsPayload() {
+    const allowedTabs = [];
+    document.querySelectorAll('#team-modal input[id^="tcb-"]').forEach(cb => {
+        if (cb.checked) {
+            allowedTabs.push(cb.id.replace('tcb-', ''));
         }
-    } catch (e) {
-        console.error("Error updating role:", e);
+    });
+
+    let viewApps = ['*'];
+    if (!document.getElementById('tcb-all-apps').checked) {
+        const val = document.getElementById('team-custom-apps-input').value;
+        viewApps = val.split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+    }
+
+    let viewProcs = ['*'];
+    if (!document.getElementById('tcb-all-procs').checked) {
+        const val = document.getElementById('team-custom-procs-input').value;
+        viewProcs = val.split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+    }
+
+    let viewConts = ['*'];
+    if (!document.getElementById('tcb-all-conts').checked) {
+        viewConts = [];
+        document.querySelectorAll('.container-vis-cb:checked').forEach(cb => {
+            viewConts.push(cb.value);
+        });
+    }
+
+    const tcbManageAlerts = document.getElementById('tcb-manage-alerts');
+    const manageAlerts = tcbManageAlerts ? tcbManageAlerts.checked : false;
+
+    const containersMap = {};
+    if (teamCurrentRole === 'admin') {
+        containersMap['*'] = ['*'];
+    } else if (teamCurrentRole === 'operator' && allowedTabs.includes('containers')) {
+        document.querySelectorAll('#team-containers-configs .config-group-card').forEach(card => {
+            const containerName = card.getAttribute('data-container');
+            const actions = [];
+            card.querySelectorAll('input:checked').forEach(input => {
+                actions.push(input.value);
+            });
+            containersMap[containerName] = actions;
+        });
+    }
+
+    const commandsMap = {};
+    if (teamCurrentRole === 'admin') {
+        commandsMap['*'] = ['*'];
+    } else if (teamCurrentRole === 'operator' && allowedTabs.includes('commands')) {
+        document.querySelectorAll('#team-commands-configs .config-group-card').forEach(card => {
+            const serviceName = card.getAttribute('data-service');
+            const actions = [];
+            card.querySelectorAll('input:checked').forEach(input => {
+                actions.push(input.value);
+            });
+            commandsMap[serviceName] = actions;
+        });
+    }
+
+    return {
+        allowed_tabs: teamCurrentRole === 'admin' ? ['*'] : allowedTabs,
+        view_applications: teamCurrentRole === 'admin' ? ['*'] : viewApps,
+        view_processes: teamCurrentRole === 'admin' ? ['*'] : viewProcs,
+        view_containers: teamCurrentRole === 'admin' ? ['*'] : viewConts,
+        manage_alerts: teamCurrentRole === 'admin' ? true : manageAlerts,
+        containers: containersMap,
+        custom_commands: commandsMap
+    };
+}
+
+
+async function submitTeamAction() {
+    const serverId = document.getElementById('team-server-id').value;
+    if (!serverId) return;
+
+    const perms = compilePermissionsPayload();
+
+    if (teamEditMode) {
+        // Edit Mode: PUT /api/servers/members/role
+        try {
+            const resp = await fetch('/api/servers/members/role', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    server_id: serverId,
+                    username: teamEditingUsername,
+                    role: teamCurrentRole,
+                    permissions: perms
+                })
+            });
+            const res = await resp.json();
+            if (resp.ok) {
+                exitTeamEditMode();
+                loadServerMembers(serverId);
+                showToast('Success', `Permissions saved for '${teamEditingUsername}'`, 'success', 3000);
+            } else {
+                alert(res.message || "Failed to save permissions.");
+            }
+        } catch (e) {
+            console.error("Error editing member permissions:", e);
+        }
+    } else {
+        // Invite Mode: POST /api/servers/members/invite
+        if (teamUsernames.size === 0) {
+            alert("Please specify at least one username.");
+            return;
+        }
+        try {
+            const resp = await fetch('/api/servers/members/invite', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    server_id: serverId,
+                    usernames: Array.from(teamUsernames),
+                    role: teamCurrentRole,
+                    permissions: perms
+                })
+            });
+            const res = await resp.json();
+            if (resp.ok) {
+                teamUsernames.clear();
+                renderTeamTags();
+                loadServerMembers(serverId);
+                showToast('Success', `User invitations sent successfully`, 'success', 3000);
+            } else {
+                alert(res.message || "Failed to invite members.");
+            }
+        } catch (e) {
+            console.error("Error inviting members:", e);
+        }
     }
 }
 

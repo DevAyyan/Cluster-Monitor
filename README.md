@@ -10,12 +10,12 @@ It is designed with a **hybrid architecture** that supports both a zero-dependen
 
 ```mermaid
 flowchart TD
-    subgraph Client Panel ["💻 Frontend Dashboard"]
+    subgraph ClientPanel ["💻 Frontend Dashboard"]
         UI["Vanilla HTML/JS/CSS Client"]
         WSClient["WebSocket Client (Redis Stream)"]
     end
 
-    subgraph Host Server ["🛡️ Host (Go Backend)"]
+    subgraph HostServer ["🛡️ Host (Go Backend)"]
         API["HTTP API Router"]
         WSMgr["WebSocket Manager"]
         RQueue["Redis Fleet Job Queue"]
@@ -25,32 +25,32 @@ flowchart TD
         Alerts["Alerting Loop (Goroutine)"]
     end
 
-    subgraph Target Node ["⚡ Target Server"]
+    subgraph TargetNode ["⚡ Target Server"]
         Agent["Go Target Agent (systemd service)"]
         SSHPort["SSH Daemon (TCP 22)"]
     end
 
     %% Client Interactions
-    UI -->|JSON API Requests| API
-    WSClient <-->|Real-time Metrics Stream| Cache
+    UI -->|"JSON API Requests"| API
+    WSClient <-->|"Real-time Metrics Stream"| Cache
 
     %% Telemetry & Control Routing
-    API -->|Proxies Requests| WSMgr
-    WSMgr <-->|Bi-directional WS Connection (Port 5000)| Agent
-    
+    API -->|"Proxies Requests"| WSMgr
+    WSMgr <-->|"Bi-directional WS Connection (Port 5000)"| Agent
+
     %% SSH Fallback & Bootstrapping
-    API -->|Auto-Bootstrap & Fallback SSH Commands| SSHPort
-    WPool -->|SSH Command Queries| SSHPort
-    
+    API -->|"Auto-Bootstrap & Fallback SSH Commands"| SSHPort
+    WPool -->|"SSH Command Queries"| SSHPort
+
     %% Worker Ingestion
-    RQueue <-->|Job Dequeue| WPool
-    WPool -->|Fetch Live Stats| Agent
-    WPool -->|Store Metrics| DB
-    WPool -->|Cache JSON| Cache
+    RQueue <-->|"Job Dequeue"| WPool
+    WPool -->|"Fetch Live Stats"| Agent
+    WPool -->|"Store Metrics"| DB
+    WPool -->|"Cache JSON"| Cache
 
     %% Alerting
-    Alerts -->|Scan Metrics| DB
-    Alerts -->|Trigger Alert Emails| SMTP["SMTP Server"]
+    Alerts -->|"Scan Metrics"| DB
+    Alerts -->|"Trigger Alert Emails"| SMTP["SMTP Server"]
 ```
 
 ---

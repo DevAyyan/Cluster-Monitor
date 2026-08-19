@@ -17,7 +17,7 @@ COPY cluster-target/cluster-target.service /app/agent_assets/cluster-target.serv
 COPY cluster-host/backend/go.mod cluster-host/backend/go.sum ./cluster-host/backend/
 RUN cd cluster-host/backend && go mod download
 COPY cluster-host/backend ./cluster-host/backend
-RUN cd cluster-host/backend && CGO_ENABLED=0 GOOS=linux go build -o /app/backend .
+RUN cd cluster-host/backend && CGO_ENABLED=0 GOOS=linux go build -o /app/backend ./cmd/host
 
 FROM alpine:3.18
 WORKDIR /app

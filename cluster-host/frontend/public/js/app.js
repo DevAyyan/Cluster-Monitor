@@ -138,8 +138,18 @@ async function fetchUserProfile() {
         // Populate sidebar footer
         const profileName = document.getElementById('user-profile-name');
         const profileEmail = document.getElementById('user-profile-email');
-        if (profileName) profileName.textContent = user.username;
-        if (profileEmail) profileEmail.textContent = user.email;
+        const profileAvatar = document.getElementById('user-profile-avatar');
+
+        if (profileName) profileName.textContent = user.username || 'GitHub User';
+        if (profileEmail) profileEmail.textContent = user.email || '';
+        if (profileAvatar && user.username) {
+            const avatarUrl = `https://github.com/${user.username}.png?size=100`;
+            profileAvatar.src = avatarUrl;
+            profileAvatar.onerror = function() {
+                this.onerror = null;
+                this.src = `https://github.com/identicons/${user.username}.png`;
+            };
+        }
 
         // Populate alert email display
         const alertDisplay = document.getElementById('alert-email-display');

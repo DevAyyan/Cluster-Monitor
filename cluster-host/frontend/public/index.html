@@ -209,9 +209,7 @@
         </div>
         <div class="sidebar-footer" style="padding: 15px; border-top: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 10px; margin-top: auto;">
             <div id="user-profile-card" style="display: flex; align-items: center; gap: 10px;">
-                <div style="width: 32px; height: 32px; border-radius: 50%; background: var(--border-color); display: flex; align-items: center; justify-content: center; color: var(--primary);">
-                    <i class="fa-solid fa-user"></i>
-                </div>
+                <img id="user-profile-avatar" src="https://github.com/identicons/user.png" style="width: 36px; height: 36px; border-radius: 50%; border: 1.5px solid var(--primary); object-fit: cover; background: var(--bg-card); flex-shrink: 0;" alt="GitHub Avatar" onerror="this.onerror=null; this.src='https://github.com/identicons/user.png';">
                 <div style="display: flex; flex-direction: column; overflow: hidden; width: 100%;">
                     <span id="user-profile-name" style="font-size: 13px; font-weight: 600; color: var(--text-primary); text-overflow: ellipsis; white-space: nowrap; overflow: hidden;">GitHub User</span>
                     <span id="user-profile-email" style="font-size: 11px; color: var(--text-secondary); text-overflow: ellipsis; white-space: nowrap; overflow: hidden;">user@github.com</span>

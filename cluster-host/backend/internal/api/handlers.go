@@ -764,7 +764,7 @@ func (h *APIHandler) HandleGetServers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Evaluate online/offline state dynamically based on last seen heartbeat (threshold: 90 seconds)
-		if time.Since(s.LastSeen) > 90*time.Second {
+		if time.Since(s.LastSeen.UTC()) > 90*time.Second {
 			s.Status = "offline"
 			_, _ = h.db.Exec("UPDATE servers SET status = 'offline' WHERE id = $1 AND status != 'offline'", s.ID)
 		}
@@ -832,7 +832,7 @@ func (h *APIHandler) HandleGetActiveServers(w http.ResponseWriter, r *http.Reque
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if time.Since(s.LastSeen) > 90*time.Second {
+		if time.Since(s.LastSeen.UTC()) > 90*time.Second {
 			s.Status = "offline"
 			continue // Exclude inactive servers
 		}

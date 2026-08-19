@@ -15,7 +15,7 @@ type PostgresDB struct {
 }
 
 func NewPostgres(cfg *config.Config) (*PostgresDB, error) {
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s timezone=UTC",
 		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName, cfg.DBSSLMode)
 
 	var db *sql.DB
@@ -58,8 +58,8 @@ func (p *PostgresDB) initSchema() error {
 			ssh_password TEXT,
 			ssh_port INTEGER DEFAULT 22,
 			status VARCHAR(50) DEFAULT 'unknown',
-			last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			last_seen TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+			created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 			owner_id VARCHAR(255)
 		);`,
 		`CREATE TABLE IF NOT EXISTS monitored_services (

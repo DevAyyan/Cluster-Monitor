@@ -764,7 +764,12 @@ func (h *APIHandler) HandleGetServers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Evaluate online/offline state dynamically based on last seen heartbeat (threshold: 90 seconds)
-		if time.Since(s.LastSeen.UTC()) > 90*time.Second {
+		info, _ := ssh.LoadServerSSHInfo(h.db, h.encKey, s.ID)
+		if wsPkg.Manager.IsConnected(s.ID) || ssh.IsDemoServer(info, s.ID) {
+			s.Status = "online"
+			s.LastSeen = time.Now()
+			_, _ = h.db.Exec("UPDATE servers SET status = 'online', last_seen = NOW() WHERE id = $1 AND status != 'online'", s.ID)
+		} else if time.Since(s.LastSeen.UTC()) > 90*time.Second {
 			s.Status = "offline"
 			_, _ = h.db.Exec("UPDATE servers SET status = 'offline' WHERE id = $1 AND status != 'offline'", s.ID)
 		}
@@ -1572,6 +1577,7 @@ func (h *APIHandler) HandleGetMetrics(w http.ResponseWriter, r *http.Request, se
 
 	// Return cached metrics from Redis if present to keep Dashboard and Overview in sync
 	if cached, ok := h.redis.GetCachedMetrics(serverID); ok {
+		_, _ = h.db.Exec("UPDATE servers SET status = 'online', last_seen = NOW() WHERE id = $1", serverID)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cached)
 		return

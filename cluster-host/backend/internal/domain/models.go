@@ -79,10 +79,12 @@ type CommandExecutionLog struct {
 	ServerID    string    `json:"server_id"`
 	ServiceName string    `json:"service_name"`
 	CommandType string    `json:"command_type"`
+	Command     string    `json:"command"`
 	ExecutedBy  string    `json:"executed_by"`
 	ExecutedAt  time.Time `json:"executed_at"`
 	Status      string    `json:"status"`
 	Output      string    `json:"output"`
+	DurationMs  int       `json:"duration_ms"`
 }
 
 type UserPermissions struct {

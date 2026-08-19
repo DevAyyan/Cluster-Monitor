@@ -8,6 +8,7 @@
 cluster-target
 cluster-backend
 cluster-host/backend/cluster-backend
+cluster-host/backend/host
 cluster-host/backend/agent_assets/cluster-target
 cluster-target/cluster-target
 

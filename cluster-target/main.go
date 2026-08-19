@@ -561,10 +561,10 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSystemLogs(w http.ResponseWriter, r *http.Request) {
-	out, err := exec.Command("bash", "-c", "journalctl -n 100 --no-pager 2>/dev/null").CombinedOutput()
-	if err != nil && len(out) == 0 {
-		logAPIFailure("/systemlogs", "journalctl", http.StatusInternalServerError, err.Error())
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	out, _ := exec.Command("bash", "-c", "journalctl -n 100 --no-pager 2>/dev/null || journalctl --user -n 100 --no-pager 2>/dev/null || dmesg | tail -n 100").CombinedOutput()
+	if len(out) == 0 {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("No system logs available or permission required."))
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
@@ -1377,8 +1377,16 @@ func startAgentWSLoop(ep string) {
 		close(stopPush)
 		conn.Close()
 		log.Printf("[ws-client] Connection closed: %v. Reconnecting in 2s...", err)
-		time.Sleep(2 * time.Second)
 	}
+}
+
+var wsWriteMu sync.Mutex
+
+func safeWriteWSMessage(conn *websocket.Conn, messageType int, data []byte) error {
+	wsWriteMu.Lock()
+	defer wsWriteMu.Unlock()
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return conn.WriteMessage(messageType, data)
 }
 
 func runMetricsPushLoop(conn *websocket.Conn, stop chan struct{}) {
@@ -1399,8 +1407,7 @@ func runMetricsPushLoop(conn *websocket.Conn, stop chan struct{}) {
 				Payload:   rawPayload,
 			}
 			rawMsg, _ := json.Marshal(msg)
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := conn.WriteMessage(websocket.TextMessage, rawMsg); err != nil {
+			if err := safeWriteWSMessage(conn, websocket.TextMessage, rawMsg); err != nil {
 				return
 			}
 		case <-stop:
@@ -1490,8 +1497,7 @@ func processHostCommand(conn *websocket.Conn, msg WSMessage) {
 	}
 	rawMsg, _ := json.Marshal(resMsg)
 
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	_ = conn.WriteMessage(websocket.TextMessage, rawMsg)
+	_ = safeWriteWSMessage(conn, websocket.TextMessage, rawMsg)
 }
 
 func respondWithStatus(conn *websocket.Conn, reqID string, status int, body []byte) {
@@ -1507,7 +1513,7 @@ func respondWithStatus(conn *websocket.Conn, reqID string, status int, body []by
 		Payload:   rawPayload,
 	}
 	rawMsg, _ := json.Marshal(resMsg)
-	_ = conn.WriteMessage(websocket.TextMessage, rawMsg)
+	_ = safeWriteWSMessage(conn, websocket.TextMessage, rawMsg)
 }
 
 func handleExecCommand(w http.ResponseWriter, r *http.Request) {

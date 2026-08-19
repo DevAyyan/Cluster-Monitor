@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -521,8 +522,15 @@ func SSHGetContainers(info ServerSSHInfo) (map[string]interface{}, error) {
 // SSHGetSystemLogs runs journalctl over SSH.
 func SSHGetSystemLogs(info ServerSSHInfo) (string, error) {
 	data, err := DoAgentRequest(info, "systemlogs")
-	if err == nil {
+	if err == nil && len(data) > 0 {
 		return string(data), nil
+	}
+
+	if IsLocalHost(info) {
+		out, _ := exec.Command("bash", "-c", "journalctl -n 100 --no-pager 2>/dev/null || journalctl --user -n 100 --no-pager 2>/dev/null || dmesg | tail -n 100").CombinedOutput()
+		if len(out) > 0 {
+			return string(out), nil
+		}
 	}
 
 	// Fallback to raw SSH execution if agent fails

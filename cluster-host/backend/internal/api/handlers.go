@@ -1493,14 +1493,15 @@ func (h *APIHandler) HandleGetSystemLogsProxy(w http.ResponseWriter, r *http.Req
 	}
 
 	logs, err := ssh.SSHGetSystemLogs(info)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-SSH-Unavailable", "1")
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{"error": "SSH collection unavailable", "detail": err.Error()})
+	w.Header().Set("Content-Type", "text/plain")
+	if err != nil || len(logs) == 0 {
+		if err != nil {
+			w.Write([]byte("System log collection unavailable: " + err.Error()))
+		} else {
+			w.Write([]byte("No system logs collected for this server."))
+		}
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(logs))
 }
 

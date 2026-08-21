@@ -231,13 +231,5 @@ func (wp *WorkerPool) processFleetJob(workerID int, job domain.FleetJob) {
 				wp.redis.SetCachedJSON("storage:"+job.ServerID, parts, 60)
 			}
 		}
-
-	case "fetch_containers":
-		if !ssh.IsDemoServer(info, job.ServerID) {
-			conts, err := ssh.SSHGetContainers(info)
-			if err == nil && conts != nil {
-				wp.redis.SetCachedJSON("containers:"+job.ServerID, conts, 60)
-			}
-		}
 	}
 }

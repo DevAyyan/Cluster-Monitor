@@ -1130,26 +1130,23 @@ func (h *APIHandler) HandleGetContainersProxy(w http.ResponseWriter, r *http.Req
 
 	cacheKey := "containers:" + serverID
 	var payload map[string]interface{}
-	livePayload, liveErr := ssh.SSHGetContainers(info)
-	if liveErr == nil && livePayload != nil {
-		payload = livePayload
-		h.redis.SetCachedJSON(cacheKey, payload, 15)
-	} else if val, ok := h.redis.GetCachedJSON(cacheKey); ok {
+	if val, ok := h.redis.GetCachedJSON(cacheKey); ok {
 		if err := json.Unmarshal([]byte(val), &payload); err != nil {
 			payload = nil
 		}
 	}
 
 	if payload == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-SSH-Unavailable", "1")
-		w.WriteHeader(http.StatusBadGateway)
-		detail := "Docker query failed"
-		if liveErr != nil {
-			detail = liveErr.Error()
+		livePayload, err := ssh.SSHGetContainers(info)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-SSH-Unavailable", "1")
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Docker query failed", "detail": err.Error()})
+			return
 		}
-		json.NewEncoder(w).Encode(map[string]string{"error": "Docker query failed", "detail": detail})
-		return
+		payload = livePayload
+		h.redis.SetCachedJSON(cacheKey, payload, 60)
 	}
 
 	// Filter containers based on permissions

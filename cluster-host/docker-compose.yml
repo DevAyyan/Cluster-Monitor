@@ -4,9 +4,9 @@ services:
     container_name: cluster_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-cluster_monitor}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_password_123}
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -29,21 +29,21 @@ services:
     environment:
       - DB_HOST=postgres
       - REDIS_HOST=redis
-      - HOST_ENDPOINT=${HOST_ENDPOINT}
+      - HOST_ENDPOINT=${HOST_ENDPOINT:-http://localhost:8082}
       - AGENT_ASSETS_DIR=/app/agent_assets
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - SMTP_HOST=${SMTP_HOST}
-      - SMTP_PORT=${SMTP_PORT}
-      - SMTP_USER=${SMTP_USER}
-      - SMTP_PASSWORD=${SMTP_PASSWORD}
-      - SMTP_FROM=${SMTP_FROM}
-      - SMTP_FROM_NAME=${SMTP_FROM_NAME}
-      - SMTP_FROM_ADDRESS=${SMTP_FROM_ADDRESS}
-      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
-      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
-      - GITHUB_REDIRECT_URI=${GITHUB_REDIRECT_URI}
+      - POSTGRES_DB=${POSTGRES_DB:-cluster_monitor}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password_123}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-465}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-Cluster Monitor Alerts}
+      - SMTP_FROM_ADDRESS=${SMTP_FROM_ADDRESS:-}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - GITHUB_REDIRECT_URI=${GITHUB_REDIRECT_URI:-}
       - PORT=5000
     volumes:
       - ./backend/agent_assets:/app/agent_assets

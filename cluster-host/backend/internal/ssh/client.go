@@ -468,7 +468,7 @@ func SSHGetContainers(info ServerSSHInfo) (map[string]interface{}, error) {
 	cmd := `export PATH=$PATH:/usr/bin:/usr/local/bin:/usr/sbin:/sbin; docker version --format 'Docker Engine v{{.Server.Version}} (API v{{.Server.APIVersion}})' 2>/dev/null; echo "---INFO---"; docker info --format '{{.Name}} | {{.OperatingSystem}} ({{.KernelVersion}})' 2>/dev/null; echo "---CONTAINERS---"; docker ps -a --format '{"id":"{{.ID}}","name":"{{.Names}}","status":"{{.Status}}","state":"{{.State}}","image":"{{.Image}}","ports":"{{.Ports}}","created":"{{.CreatedAt}}"}' 2>/dev/null; echo "---IMAGES---"; docker images --format '{"repo":"{{.Repository}}","tag":"{{.Tag}}","id":"{{.ID}}","created":"{{.CreatedAt}}","size":"{{.Size}}"}' 2>/dev/null`
 	out, err := RunSSHCommand(info.ServerID, info.User, info.Password, info.Key, info.Host, info.Port, cmd)
 	if err != nil {
-		return map[string]interface{}{"containers": []map[string]interface{}{}, "images": []map[string]interface{}{}}, nil
+		return nil, err
 	}
 
 	dockerVer := "Docker Engine"

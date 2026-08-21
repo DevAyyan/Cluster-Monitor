@@ -2895,6 +2895,20 @@ func (h *APIHandler) HandleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	clientID := os.Getenv("GITHUB_CLIENT_ID")
 	if clientID == "" {
 		log.Println("[auth] Warning: GITHUB_CLIENT_ID is not configured.")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head><title>OAuth Configuration Required</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;} .card{background:#1e293b;padding:32px;border-radius:12px;border:1px solid #334155;box-shadow:0 10px 25px rgba(0,0,0,0.5);max-width:500px;text-align:center;} h2{color:#f59e0b;margin-top:0;font-size:20px;} p{color:#94a3b8;line-height:1.6;font-size:14px;} code{background:#0f172a;padding:3px 8px;border-radius:6px;color:#38bdf8;font-family:monospace;font-size:13px;} .btn{display:inline-block;margin-top:16px;padding:10px 20px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:6px;font-weight:500;}</style></head>
+<body>
+<div class="card">
+<h2>⚠️ GitHub OAuth Credentials Missing</h2>
+<p>To enable GitHub Single Sign-On, please add your <code>GITHUB_CLIENT_ID</code> and <code>GITHUB_CLIENT_SECRET</code> to your <code>cluster-host/.env</code> file and restart the stack.</p>
+<a href="/" class="btn">&larr; Return to Dashboard</a>
+</div>
+</body>
+</html>`)
+		return
 	}
 
 	var redirectURI string
